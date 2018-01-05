@@ -271,6 +271,9 @@ namespace Raven.Database.Server.Controllers
 
             try
             {
+                // IndexVersion is used only for replication and since this endpoint is used
+                // only by the client api and the studio so we can set the index version to null
+                data.IndexVersion = null;
                 Database.Indexes.PutIndex(index, data);
                 return GetMessageWithObject(new { Index = index }, HttpStatusCode.Created);
             }
@@ -306,6 +309,12 @@ namespace Raven.Database.Server.Controllers
         [RavenRoute("databases/{databaseName}/indexes/{*id}")]
         public async Task<HttpResponseMessage> IndexPost(string id)
         {
+            if (id == "last-queried")
+            {
+                var lastQueried = await ReadJsonObjectAsync<Dictionary<string, DateTime>>().ConfigureAwait(false);
+                return IndexUpdateLastQueried(lastQueried);
+            }
+
             var index = id;
             /*
            This is a workaround to support version 30037 and below where index post conflicts with index set priorety
@@ -373,7 +382,15 @@ namespace Raven.Database.Server.Controllers
             var index = id;
 
             var isReplication = GetQueryStringValue(Constants.IsReplicatedUrlParamName);
-            if (Database.Indexes.DeleteIndex(index) &&
+            var indexVersionAsString = GetQueryStringValue(Constants.IndexVersion);
+            int? indexVersionAsInt = null;
+            int indexVersion;
+            if (int.TryParse(indexVersionAsString, out indexVersion))
+            {
+                indexVersionAsInt = indexVersion;
+            }
+
+            if (Database.Indexes.DeleteIndex(index, deletedIndexVersion: indexVersionAsInt) &&
                 !string.IsNullOrWhiteSpace(isReplication) && isReplication.Equals("true", StringComparison.InvariantCultureIgnoreCase))
             {
                 const string emptyFrom = "<no hostname>";
@@ -652,7 +669,7 @@ namespace Raven.Database.Server.Controllers
                     .Where(x => x != null)
                 );
             var command = new AddIncludesCommand(Database, GetRequestTransaction(),
-                                                 (etag, doc) => queryResult.Includes.Add(doc), includes, loadedIds);
+                                                 (etag, doc, _) => queryResult.Includes.Add(doc), includes, loadedIds);
             foreach (var result in queryResult.Results)
             {
                 command.Execute(result);
@@ -788,7 +805,7 @@ namespace Raven.Database.Server.Controllers
             return dynamicIndexName;
         }
 
-        static Regex oldDateTimeFormat = new Regex(@"(\:|\[|{|TO\s) \s* (\d{17})", RegexOptions.Compiled | RegexOptions.IgnorePatternWhitespace);
+        static Regex oldDateTimeFormat = new Regex(@"(\d{4}\S+-\d{2}\S+-\d{2}T\d{2}\S+:\d{2}\S+:\d{2}.\d{3})(?:\d?)*", RegexOptions.Compiled | RegexOptions.IgnorePatternWhitespace);
 
         private void RewriteDateQueriesFromOldClients(IndexQuery indexQuery)
         {
@@ -802,15 +819,15 @@ namespace Raven.Database.Server.Controllers
             var builder = new StringBuilder(indexQuery.Query);
             for (int i = matches.Count - 1; i >= 0; i--) // working in reverse so as to avoid invalidating previous indexes
             {
-                var dateTimeString = matches[i].Groups[2].Value;
+                var dateTimeString = matches[i].Groups[1].Value;
 
                 DateTime time;
-                if (DateTime.TryParseExact(dateTimeString, "yyyyMMddHHmmssfff", CultureInfo.InvariantCulture, DateTimeStyles.None, out time) == false)
+                if (DateTime.TryParseExact(dateTimeString, @"yyyy\\-MM\\-ddTHH\\:mm\\:ss.fff", CultureInfo.InvariantCulture, DateTimeStyles.None, out time) == false)
                     continue;
 
-                builder.Remove(matches[i].Groups[2].Index, matches[i].Groups[2].Length);
+                builder.Remove(matches[i].Groups[0].Index, matches[i].Groups[0].Length);
                 var newDateTimeFormat = time.ToString(Default.DateTimeFormatsToWrite);
-                builder.Insert(matches[i].Groups[2].Index, newDateTimeFormat);
+                builder.Insert(matches[i].Groups[0].Index, newDateTimeFormat);
             }
             indexQuery.Query = builder.ToString();
         }

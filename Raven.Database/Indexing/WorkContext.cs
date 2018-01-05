@@ -51,7 +51,7 @@ namespace Raven.Database.Indexing
         private int workCounter;
         private readonly CancellationTokenSource cancellationTokenSource = new CancellationTokenSource();
         private static readonly ILog log = LogManager.GetCurrentClassLogger();
-        private readonly Abstractions.Threading.ThreadLocal<Stack<List<Func<string>>>> shouldNotifyOnWork = new Abstractions.Threading.ThreadLocal<Stack<List<Func<string>>>>(() =>
+        private readonly ThreadLocal<Stack<List<Func<string>>>> shouldNotifyOnWork = new ThreadLocal<Stack<List<Func<string>>>>(() =>
         {
             var stack = new Stack<List<Func<string>>>();
             stack.Push(new List<Func<string>>());
@@ -152,9 +152,14 @@ namespace Raven.Database.Indexing
                 .Select(x => x.Data.JsonDeserialization<IndexingError>())
                 .OrderBy(x => x.Timestamp);
 
+            var errorsForNonExistingIndexes = new List<IndexingError>();
+            var indexNames = IndexStorage.IndexNames.ToList();
             foreach (var error in errors)
             {
-                indexingErrors.Enqueue(error);
+                if (indexNames.Contains(error.IndexName) == false)
+                    errorsForNonExistingIndexes.Add(error);
+                else
+                    indexingErrors.Enqueue(error);
             }
 
             TransactionalStorage.Batch(accessor =>
@@ -167,6 +172,12 @@ namespace Raven.Database.Indexing
 
                     accessor.Lists.Remove("Raven/Indexing/Errors/" + error.IndexName, error.Id.ToString(CultureInfo.InvariantCulture));
                 }
+
+                errorsForNonExistingIndexes.ForEach(error =>
+                {
+                    accessor.Lists.Remove("Raven/Indexing/Errors/" + error.IndexName, error.Id.ToString(CultureInfo.InvariantCulture));
+                    accessor.General.MaybePulseTransaction();
+                });
             });
 
             errorsCounter = errors.Max(x => x.Id);
@@ -195,6 +206,7 @@ namespace Raven.Database.Indexing
                     workerWorkCounter = currentWorkCounter;
                     return true;
                 }
+                
                 CancellationToken.ThrowIfCancellationRequested();
                 if (log.IsDebugEnabled)
                     log.Debug("No work was found, workerWorkCounter: {0}, for: {1}, will wait for additional work", workerWorkCounter, name);
@@ -271,11 +283,13 @@ namespace Raven.Database.Indexing
         {
             if (log.IsDebugEnabled)
                 log.Debug("Stopping background workers");
-            doWork = false;
-            doIndexing = false;
-            doReducing = false;
+
             lock (waitForWork)
             {
+                doWork = false;
+                doIndexing = false;
+                doReducing = false;
+
                 Monitor.PulseAll(waitForWork);
             }
             ReplicationResetEvent.Set();
@@ -339,7 +353,7 @@ namespace Raven.Database.Indexing
                     });
             }
 
-            if (ignored == null || index == ignored.Index)
+            if (ignored == null)
                 return;
 
             if ((SystemTime.UtcNow - ignored.Timestamp).TotalSeconds <= 10)
@@ -357,8 +371,8 @@ namespace Raven.Database.Indexing
 
         public void StopWorkRude()
         {
-            StopWork();
             cancellationTokenSource.Cancel();
+            StopWork();
         }
 
         public CancellationToken CancellationToken
@@ -452,6 +466,9 @@ namespace Raven.Database.Indexing
                 {
                     accessor.Lists.Remove("Raven/Indexing/Errors/" + indexName, removedError.Id.ToString(CultureInfo.InvariantCulture));
                 }
+
+                using (TransactionalStorage.DisableBatchNesting())
+                    accessor.Lists.RemoveAllOlderThan("Raven/Indexing/Errors/" + indexName, DateTime.MaxValue);
             });
         }
 
@@ -640,6 +657,14 @@ namespace Raven.Database.Indexing
             {
                 recentlyDeleted.TryRemove(key);
             }
+        }
+
+        public bool IndexRemovalQueueContainsAnyFrom(IEnumerable<string> keys)
+        {
+            foreach (var key in keys)
+                if (recentlyDeleted.Contains(key))
+                    return true;
+            return false;
         }
 
         public bool ShouldRemoveFromIndex(string key)

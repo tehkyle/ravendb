@@ -568,8 +568,17 @@ namespace Raven.Database.Bundles.Replication.Controllers
                 replicas = Math.Min(destinations.Length, replicas);
             }
             Etag innerEtag = Etag.Parse(etag);
-            await ReplicationTask.WaitForReplicationAsync(innerEtag, timeout, replicas, majority, true).ConfigureAwait(false);
 
+            int numberOfReplicasToWaitFor = majority ? replicationTask.GetSizeOfMajorityFromActiveReplicationDestination(replicas) : replicas;
+
+            var numberOfReplicatesPast = await replicationTask.WaitForReplicationAsync(innerEtag, timeout, numberOfReplicasToWaitFor).ConfigureAwait(false);
+
+            if (numberOfReplicatesPast < numberOfReplicasToWaitFor)
+            {
+                throw new TimeoutException(
+                    $"Could not verify that etag {innerEtag} was replicated to {numberOfReplicasToWaitFor} servers in {timeout}. So far, it only replicated to {numberOfReplicatesPast}");
+            }
+            //If we got here than we finished replicating to the required amount of servers.
             return GetEmptyMessage();
         }
 
@@ -783,8 +792,8 @@ namespace Raven.Database.Bundles.Replication.Controllers
         {
             var src = GetQueryStringValue("from");
 
-            var replicationTask = Database.StartupTasks.OfType<ReplicationTask>().FirstOrDefault();
-            if (replicationTask == null)
+            //precaution
+            if (ReplicationTask == null)
             {
                 return GetMessageWithObject(new
                 {
@@ -792,7 +801,7 @@ namespace Raven.Database.Bundles.Replication.Controllers
                 }, HttpStatusCode.NotFound);
             }
 
-            replicationTask.HandleHeartbeat(src, wake: true);
+            ReplicationTask.HandleHeartbeat(src, wake: true);
 
             return GetEmptyMessage();
         }
@@ -928,7 +937,9 @@ namespace Raven.Database.Bundles.Replication.Controllers
 
             if (string.Equals(op, "replicate-all-to-destination", StringComparison.InvariantCultureIgnoreCase))
             {
-                replicationTask.IndexReplication.Execute(dest => dest.IsEqualTo(replicationDestination) && dest.SkipIndexReplication == false);
+                replicationTask.IndexReplication.Execute(
+                    dest => dest.IsEqualTo(replicationDestination) && dest.SkipIndexReplication == false,
+                    forceTombstoneReplication: true);
 
                 return GetEmptyMessage();
             }
@@ -941,7 +952,7 @@ namespace Raven.Database.Bundles.Replication.Controllers
                 return GetEmptyMessage();
             }
 
-            replicationTask.IndexReplication.Execute();
+            replicationTask.IndexReplication.Execute(forceTombstoneReplication: true);
             return GetEmptyMessage();
         }
 
@@ -958,7 +969,9 @@ namespace Raven.Database.Bundles.Replication.Controllers
 
             if (string.Equals(op, "replicate-all-to-destination", StringComparison.InvariantCultureIgnoreCase))
             {
-                replicationTask.TransformerReplication.Execute(dest => dest.IsEqualTo(replicationDestination) && dest.SkipIndexReplication == false);
+                replicationTask.TransformerReplication.Execute(
+                    dest => dest.IsEqualTo(replicationDestination) && dest.SkipIndexReplication == false,
+                    forceTombstoneReplication: true);
                 return GetEmptyMessage();
             }
 
@@ -970,7 +983,7 @@ namespace Raven.Database.Bundles.Replication.Controllers
                 return GetEmptyMessage();
             }
 
-            replicationTask.TransformerReplication.Execute();
+            replicationTask.TransformerReplication.Execute(forceTombstoneReplication: true);
             return GetEmptyMessage();
         }
 

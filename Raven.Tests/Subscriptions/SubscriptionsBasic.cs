@@ -1246,5 +1246,98 @@ namespace Raven.Tests.Subscriptions
                 Assert.True(etagBigger.CompareTo(afterAnotherUpdateEtag) == 0);
             }
         }
+
+        [Fact]
+        public void ShouldIncrementFailingTests()
+        {
+            using (var store = NewRemoteDocumentStore())
+            {
+
+                var lastId = string.Empty;
+                var docsAmount = 50;
+                using (var biPeople = store.BulkInsert())
+                {
+                    
+                    for (int i = 0; i < docsAmount; i++)
+                    {
+                        lastId = biPeople.Store(new Raven.Tests.Common.Dto.Company()
+                        {
+                            Name = "Something Inc. #" + i
+                        });
+                    }
+                }
+
+                var lastDoc = store.DatabaseCommands.Get(lastId);
+
+
+                var id = store.Subscriptions.Create(new SubscriptionCriteria<Company>());
+
+                var subscription = store.Subscriptions.Open<Company>(id, new SubscriptionConnectionOptions()
+                {
+                    BatchOptions = new SubscriptionBatchOptions()
+                    {
+                        MaxDocCount = 1
+                    },
+                    IgnoreSubscribersErrors = true
+                });
+
+
+                var cde = new CountdownEvent(docsAmount);
+
+                subscription.Subscribe(x =>
+                {
+                    throw new Exception();
+                });
+
+                subscription.AfterBatch += processed => cde.Signal(processed);
+                Assert.True(cde.Wait(10000));
+
+                var subscriptionStatus = store.Subscriptions.GetSubscriptions(0, 1024).First();
+
+                Assert.Equal(subscriptionStatus.AckEtag, lastDoc.Etag);
+            }
+        }
+
+
+        [Theory]
+        [PropertyData("Storages")]
+        public void ShouldFireAcknowledgementTimeoutEvent(string storage)
+        {
+            using (var store = NewDocumentStore(requestedStorage: storage))
+            {
+                var id = store.Subscriptions.Create(new SubscriptionCriteria());
+                var subscriptionZeroTimeout = store.Subscriptions.Open(id, new SubscriptionConnectionOptions
+                {
+                    BatchOptions = new SubscriptionBatchOptions()
+                    {
+                        AcknowledgmentTimeout = TimeSpan.FromMilliseconds(-10) // the client won't be able to acknowledge in negative time
+                    }
+                });
+                store.Changes().WaitForAllPendingSubscriptions();
+                var mre = new ManualResetEvent(false);
+                var docs = new BlockingCollection<RavenJObject>();
+                subscriptionZeroTimeout.SubscriptionConnectionInterrupted += (ex,willReconnect) =>
+                {
+                    Assert.True(ex is SubscriptionAckTimeoutException);
+                    Assert.True(willReconnect);
+                    mre.Set();
+                };
+                subscriptionZeroTimeout.Subscribe(docs.Add);
+
+                using (var session = store.OpenSession())
+                {
+                    session.Store(new User { Name = "Raven" });
+                    session.SaveChanges();
+                }
+
+                RavenJObject document;
+
+                Assert.True(docs.TryTake(out document, waitForDocTimeout));
+                Assert.Equal("Raven", document.Value<string>("Name"));
+                Assert.True(mre.WaitOne(waitForDocTimeout));
+
+                subscriptionZeroTimeout.Dispose();
+            }
+        }
     }
 }

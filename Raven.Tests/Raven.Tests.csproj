@@ -269,6 +269,7 @@
     <Compile Include="DistinctFacets\FromUser.cs" />
     <Compile Include="Faceted\LargeFacets.cs" />
     <Compile Include="Indexes\IndexReplacement.cs" />
+    <Compile Include="Indexes\TransformerParameterTest.cs" />
     <Compile Include="IndexMerging\SimpleIndexMerging.cs" />
     <Compile Include="Embedded\EmbeddedTests.cs" />
     <Compile Include="Bugs\WhenStoringADocumentWithAsyncSessionAndZipCompressionOn.cs" />
@@ -652,6 +653,7 @@
     <Compile Include="Replication\IndexReplication.cs" />
     <Compile Include="Replication\TransformerReplication.cs" />
     <Compile Include="ResultsTransformer\AsyncTransformWith.cs" />
+    <Compile Include="ResultsTransformer\NullDynamicValuesInTransformerOperation.cs" />
     <Compile Include="ResultsTransformer\TransformerParametersToResultTransformer.cs" />
     <Compile Include="ResultsTransformer\NestingTransformers.cs" />
     <Compile Include="ResultsTransformer\StonglyTypedResultsTransformer.cs" />
@@ -843,9 +845,12 @@
     <Compile Include="Storage\Voron\QueueStorageActionsTests.cs" />
     <Compile Include="Storage\TasksStorageActionsTests.cs" />
     <Compile Include="Storage\Voron\DocumentsStorageActionsTests.cs" />
+    <Compile Include="Subscriptions\SubscriptionInitialEtagGap.cs" />
+    <Compile Include="Subscriptions\SubscriptionOperationsSignaling.cs" />
     <Compile Include="Suggestions\LegacySuggestionsHandling.cs" />
     <Compile Include="Subscriptions\SubscriptionsBasic.cs" />
     <Compile Include="Subscriptions\SubscriptionsPaths.cs" />
+    <Compile Include="Suggestions\SuggestionsLazyAsync.cs" />
     <Compile Include="Suggestions\SuggestionsUsingAnIndex.cs" />
     <Compile Include="Synchronization\ConcurrentJsonDocumentSortedListTests.cs" />
     <Compile Include="T1.cs" />
@@ -965,6 +970,7 @@
     <Compile Include="Triggers\Bugs\Person.cs" />
     <Compile Include="Triggers\CascadeDeleteTrigger.cs" />
     <Compile Include="Triggers\DeleteTriggers.cs" />
+    <Compile Include="Triggers\DocumentQueryTriggers.cs" />
     <Compile Include="Triggers\IndexToDataTable.cs" />
     <Compile Include="Triggers\IndexTriggers.cs" />
     <Compile Include="Triggers\PutTriggers.cs" />

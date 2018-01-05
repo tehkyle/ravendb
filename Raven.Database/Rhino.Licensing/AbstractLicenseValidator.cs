@@ -27,25 +27,30 @@ namespace Rhino.Licensing
 
         private bool licenseInfoLogged;
 
+
         /// <summary>
         /// Standard Time servers
         /// </summary>
-        protected readonly string[] TimeServers = new[]
+        protected readonly string[] TimeServers = StandardTimeServer; //allowing to override the standard
+
+        public static readonly string[] StandardTimeServer = 
         {
-            "time.nist.gov",
-            "time-nw.nist.gov",
+            "europe.pool.ntp.org",
+            "north-america.pool.ntp.org",
+            "asia.pool.ntp.org",
+            "oceania.pool.ntp.org",
+            "south-america.pool.ntp.org",
+            "africa.pool.ntp.org",
+            "time.nist.gov",            
             "time-a.nist.gov",
             "time-b.nist.gov",
             "time-a.timefreq.bldrdoc.gov",
             "time-b.timefreq.bldrdoc.gov",
             "time-c.timefreq.bldrdoc.gov",
             "utcnist.colorado.edu",
-            "nist1.datum.com",
-            "nist1.dc.certifiedtime.com",
-            "nist1.nyc.certifiedtime.com",
         };
 
-        private readonly string licenseServerUrl;
+    private readonly string licenseServerUrl;
         private readonly Guid clientId;
         private readonly string publicKey;
         private Timer nextLeaseTimer;
@@ -247,8 +252,18 @@ namespace Rhino.Licensing
         /// </summary>
         public virtual void AssertValidLicense(Action onValidLicense, bool turnOffDiscoveryClient = false, bool firstTime = false, bool forceUpdate = false)
         {
-            LicenseAttributes.Clear();
-            if (IsLicenseValid(firstTime,forceUpdate))
+            Monitor.Enter(LicenseAttributesLock);
+
+            try
+            {
+                LicenseAttributes.Clear();
+            }
+            finally
+            {
+                Monitor.Exit(LicenseAttributesLock);
+            }
+
+            if (IsLicenseValid(firstTime, forceUpdate))
             {
                 onValidLicense();
 
@@ -315,7 +330,7 @@ namespace Rhino.Licensing
                         result = ValidateLicense(firstTime, forceUpdate);
                 }
 
-                if (result && IsOemLicense()) 
+                if (result && IsOemLicense())
                     return true;
 
                 if (result)
@@ -631,16 +646,28 @@ namespace Rhino.Licensing
             Name = name.Value;
 
             var license = doc.SelectSingleNode("/license");
-            foreach (XmlAttribute attrib in license.Attributes)
-            {
-                if (attrib.Name == "type" || attrib.Name == "expiration" || attrib.Name == "id")
-                    continue;
 
-                LicenseAttributes[attrib.Name] = attrib.Value;
+            Monitor.Enter(LicenseAttributesLock);
+
+            try
+            {
+                foreach (XmlAttribute attrib in license.Attributes)
+                {
+                    if (attrib.Name == "type" || attrib.Name == "expiration" || attrib.Name == "id")
+                        continue;
+
+                    LicenseAttributes[attrib.Name] = attrib.Value;
+                }
+            }
+            finally
+            {
+                Monitor.Exit(LicenseAttributesLock);
             }
 
             return true;
         }
+
+        public object LicenseAttributesLock = new object();
 
         private bool TryGetValidDocument(string licensePublicKey, XmlDocument doc)
         {

@@ -27,7 +27,6 @@ using Raven.Database.Indexing;
 using Raven.Database.Linq;
 using Raven.Database.Queries;
 using Raven.Database.Storage;
-using Raven.Database.Util;
 using Raven.Json.Linq;
 
 namespace Raven.Database.Actions
@@ -37,8 +36,8 @@ namespace Raven.Database.Actions
         private volatile bool isPrecomputedBatchForNewIndexIsRunning;
         private readonly object precomputedLock = new object();
 
-        public IndexActions(DocumentDatabase database, SizeLimitedConcurrentDictionary<string, TouchedDocumentInfo> recentTouches, IUuidGenerator uuidGenerator, ILog log)
-            : base(database, recentTouches, uuidGenerator, log)
+        public IndexActions(DocumentDatabase database, IUuidGenerator uuidGenerator, ILog log)
+            : base(database, uuidGenerator, log)
         {
         }
 
@@ -119,12 +118,13 @@ namespace Raven.Database.Actions
             return indexEtag;
         }
 
-        internal void CheckReferenceBecauseOfDocumentUpdate(string key, IStorageActionsAccessor actions, string[] participatingIds = null)
+        internal int CheckReferenceBecauseOfDocumentUpdate(
+            string key, 
+            IStorageActionsAccessor actions, 
+            IEnumerable<string> participatingIds = null)
         {
-            TouchedDocumentInfo touch;
-            RecentTouches.TryRemove(key, out touch);
             Stopwatch sp = null;
-            int count = 0;
+            var count = 0;
 
             using (Database.TransactionalStorage.DisableBatchNesting())
             {
@@ -132,11 +132,12 @@ namespace Raven.Database.Actions
                 Database.TransactionalStorage.Batch(externalActions =>
                 {
                     var referencingKeys = externalActions.Indexing.GetDocumentsReferencing(key);
-                    if (participatingIds != null)
-                        referencingKeys = referencingKeys.Except(participatingIds);
 
                     foreach (var referencing in referencingKeys)
                     {
+                        if (participatingIds != null && participatingIds.Contains(referencing))
+                                continue;
+
                         Etag preTouchEtag = null;
                         Etag afterTouchEtag = null;
                         try
@@ -175,15 +176,11 @@ namespace Raven.Database.Actions
                                                            "Consider restructuring your indexes to avoid LoadDocument on such a popular document.");
                             }
                         }
-
-                        RecentTouches.Set(referencing, new TouchedDocumentInfo
-                        {
-                            PreTouchEtag = preTouchEtag,
-                            TouchedEtag = afterTouchEtag
-                        });
                     }
                 });
             }
+
+            return count;
         }
 
         private static void IsIndexNameValid(string name)
@@ -240,6 +237,16 @@ namespace Raven.Database.Actions
             name = name.Trim();
             IsIndexNameValid(name);
 
+            var deletedIndexVersion = IndexDefinitionStorage.GetDeletedIndexVersion(name, definition.IndexId);
+            if (isReplication && definition.IndexVersion != null &&
+                deletedIndexVersion > definition.IndexVersion)
+            {
+                // we got a new index definition from replication
+                // where its version is smaller then the deleted one
+                // probably from an outdated node
+                return null;
+            }
+
             var existingIndex = IndexDefinitionStorage.GetIndexDefinition(name);
             if (existingIndex != null)
             {
@@ -273,35 +280,41 @@ namespace Raven.Database.Actions
 
             AssertAnalyzersValid(definition);
 
+            var existingIndexVersion = existingIndex?.IndexVersion;
             switch (creationOptions ?? FindIndexCreationOptions(definition, ref name))
             {
                 case IndexCreationOptions.Noop:
+                    definition.IndexVersion = Math.Max(definition.IndexVersion ?? 0, existingIndexVersion ?? 0);                    
                     return null;
                 case IndexCreationOptions.UpdateWithoutUpdatingCompiledIndex:
                     // ensure that the code can compile
                     new DynamicViewCompiler(definition.Name, definition, Database.Extensions, IndexDefinitionStorage.IndexDefinitionsPath, Database.Configuration).GenerateInstance();
                     IndexDefinitionStorage.UpdateIndexDefinitionWithoutUpdatingCompiledIndex(definition);
+
+                    definition.IndexVersion = Math.Max(definition.IndexVersion ?? 0, existingIndexVersion ?? 0);
                     if (isReplication == false)
-                        definition.IndexVersion = (definition.IndexVersion ?? 0) + 1;
+                        definition.IndexVersion++;
                     return null;
                 case IndexCreationOptions.Update:
                     // ensure that the code can compile
                     new DynamicViewCompiler(definition.Name, definition, Database.Extensions, IndexDefinitionStorage.IndexDefinitionsPath, Database.Configuration).GenerateInstance();
                     DeleteIndex(name);
+
+                    definition.IndexVersion = Math.Max(definition.IndexVersion ?? 0, existingIndexVersion ?? 0);
                     if (isReplication == false)
-                        definition.IndexVersion = (definition.IndexVersion ?? 0) + 1;
+                        definition.IndexVersion++;
                     break;
                 case IndexCreationOptions.Create:
                     if (isReplication == false)
                     {
                         // we create a new index,
                         // we need to restore its previous IndexVersion (if it was deleted before)
-                        var deletedIndexVersion = IndexDefinitionStorage.GetDeletedIndexVersion(definition);
+
                         var replacingIndexVersion = GetOriginalIndexVersion(definition.Name);
                         definition.IndexVersion = Math.Max(deletedIndexVersion, replacingIndexVersion);
                         definition.IndexVersion++;
                     }
-                        
+
                     break;
             }
 
@@ -326,7 +339,7 @@ namespace Raven.Database.Actions
                 case IndexLockMode.SideBySide:
                     if (isUpdateBySideSide == false)
                     {
-                        Log.Info("Index {0} not saved because it might be only updated by side-by-side index");
+                        Log.Info("Index {0} not saved because it might be only updated by side-by-side index", name);
                         throw new InvalidOperationException("Can not overwrite locked index: " + name + ". This index can be only updated by side-by-side index.");
                     }
 
@@ -374,7 +387,7 @@ namespace Raven.Database.Actions
                 }
 
                 var indexesIds = createdIndexes.Select(x => Database.IndexStorage.GetIndexInstance(x).indexId).ToArray();
-                Database.TransactionalStorage.Batch(accessor => accessor.Indexing.SetIndexesPriority(indexesIds, prioritiesList.ToArray()));
+                SetIndexesPriority(indexesIds, prioritiesList);
 
                 for (var i = 0; i < createdIndexes.Count; i++)
                 {
@@ -396,10 +409,15 @@ namespace Raven.Database.Actions
             catch (Exception e)
             {
                 Log.WarnException("Could not create index batch", e);
-                foreach (var index in createdIndexes)
+
+                if (isReplication == false)
                 {
-                    DeleteIndex(index);
+                    foreach (var index in createdIndexes)
+                    {
+                        DeleteIndex(index);
+                    }
                 }
+
                 throw;
             }
         }
@@ -459,7 +477,7 @@ namespace Raven.Database.Actions
                 }
 
                 var indexesIds = createdIndexes.Select(x => Database.IndexStorage.GetIndexInstance(x.Name).indexId).ToArray();
-                Database.TransactionalStorage.Batch(accessor => accessor.Indexing.SetIndexesPriority(indexesIds, prioritiesList.ToArray()));
+                SetIndexesPriority(indexesIds, prioritiesList);
 
                 for (var i = 0; i < createdIndexes.Count; i++)
                 {
@@ -483,13 +501,70 @@ namespace Raven.Database.Actions
             catch (Exception e)
             {
                 Log.WarnException("Could not create index batch", e);
-                foreach (var index in createdIndexes)
+
+                if (isReplication == false)
                 {
-                    DeleteIndex(index.Name);
-                    if (index.IsSideBySide)
-                        Database.Documents.Delete(index.Name, null, null);
+                    foreach (var index in createdIndexes)
+                    {
+                        DeleteIndex(index.Name);
+                        if (index.IsSideBySide)
+                            Database.Documents.Delete(index.Name, null, null);
+                    }
                 }
+
                 throw;
+            }
+        }
+
+        private void SetIndexesPriority(int[] indexesIds, List<IndexingPriority> prioritiesList)
+        {
+            for (var retries = 0; retries < 10; retries++)
+            {
+                try
+                {
+                    Database.TransactionalStorage.Batch(accessor => accessor.Indexing.SetIndexesPriority(indexesIds, prioritiesList.ToArray()));
+                    return;
+                }
+                catch (Exception e)
+                {
+                    if (TransactionalStorageHelper.IsWriteConflict(e, out e))
+                    {
+                        Thread.Sleep(100);
+                        continue;
+                    }
+
+                    throw;
+                }
+            }
+
+            // we couldn't set the index priority for all indexes at once
+            // we'll try to set the index priority one by one
+
+            for (var i = 0; i < indexesIds.Length; i++)
+            {
+                var indexId = indexesIds[i];
+                var priority = prioritiesList[i];
+                try
+                {
+                    Database.TransactionalStorage.Batch(accessor => accessor.Indexing.SetIndexPriority(indexId, priority));
+                }
+                catch (Exception e)
+                {
+                    if (TransactionalStorageHelper.IsWriteConflict(e, out e) == false)
+                        throw;
+
+                    var message = $"Could not set index priority to: {priority} for index id: {indexId}";
+                    Log.ErrorException(message, e);
+                    Database.AddAlert(new Alert
+                    {
+                        AlertLevel = AlertLevel.Error,
+                        CreatedAt = SystemTime.UtcNow,
+                        Message = e.Message,
+                        Title = message,
+                        Exception = e.ToString(),
+                        UniqueKey = message
+                    });
+                }
             }
         }
 
@@ -932,32 +1007,48 @@ namespace Raven.Database.Actions
         }
 
         [MethodImpl(MethodImplOptions.Synchronized)]
-        public bool DeleteIndex(string name)
+        public bool DeleteIndex(string name, int? deletedIndexVersion = null)
         {
             var instance = IndexDefinitionStorage.GetIndexDefinition(name);
             if (instance == null)
                 return false;
 
-            DeleteIndex(instance);
+            DeleteIndex(instance, deletedIndexVersion: deletedIndexVersion);
             return true;
         }
 
         internal void DeleteIndex(IndexDefinition instance, bool removeByNameMapping = true, 
-            bool clearErrors = true, bool removeIndexReplaceDocument = true, bool isSideBySideReplacement = false)
+            bool clearErrors = true, bool removeIndexReplaceDocument = true, 
+            bool isSideBySideReplacement = false, int? deletedIndexVersion = null)
         {
             using (IndexDefinitionStorage.TryRemoveIndexContext())
             {
                 if (instance == null)
                     return;
 
-                // Set up a flag to signal that this is something we're doing
-                TransactionalStorage.Batch(actions => actions.Lists.Set("Raven/Indexes/PendingDeletion", instance.IndexId.ToString(CultureInfo.InvariantCulture), (RavenJObject.FromObject(new
+                var currentIndexVersion = instance.IndexVersion;
+                if (deletedIndexVersion != null &&
+                    currentIndexVersion != null &&
+                    currentIndexVersion > deletedIndexVersion)
                 {
-                    TimeOfOriginalDeletion = SystemTime.UtcNow,
-                    instance.IndexId,
-                    IndexName = instance.Name,
-                    instance.IndexVersion
-                })), UuidType.Tasks));
+                    // the index version is larger than the deleted one
+                    // got an old delete from an outdated node
+                    return;
+                }
+
+                // Set up a flag to signal that this is something we're doing
+                TransactionalStorage.Batch(actions =>
+                {
+                    actions.Lists.Set("Raven/Indexes/PendingDeletion", 
+                        instance.IndexId.ToString(CultureInfo.InvariantCulture),
+                        RavenJObject.FromObject(new
+                        {
+                            TimeOfOriginalDeletion = SystemTime.UtcNow,
+                            instance.IndexId,
+                            IndexName = instance.Name,
+                            instance.IndexVersion
+                        }), UuidType.Tasks);
+                });
 
                 // Delete the main record synchronously
                 IndexDefinitionStorage.RemoveIndex(instance.IndexId, removeByNameMapping);
@@ -973,12 +1064,31 @@ namespace Raven.Database.Actions
                     Database.Documents.Delete(Constants.IndexReplacePrefix + instance.Name, null, null);
                 }
 
+                Database.IndexStorage.DeleteSuggestionsData(instance.Name);
+
                 //remove the header information in a sync process
-                TransactionalStorage.Batch(actions => actions.Indexing.PrepareIndexForDeletion(instance.IndexId));
+                PrepareIndexDeletion(instance.IndexId);
+
                 //and delete the data in the background
                 Database.Maintenance.StartDeletingIndexDataAsync(instance.IndexId, instance.Name);
 
                 var indexChangeType = isSideBySideReplacement ? IndexChangeTypes.SideBySideReplace : IndexChangeTypes.IndexRemoved;
+
+                var version = currentIndexVersion ?? 0;
+                if (deletedIndexVersion != null)
+                    version = Math.Max(version, deletedIndexVersion.Value);
+
+                TransactionalStorage.Batch(actions =>
+                {
+                    if (instance.Name.StartsWith(Constants.SideBySideIndexNamePrefix))
+                        return;
+
+                    var metadata = new RavenJObject
+                    {
+                        {IndexDefinitionStorage.IndexVersionKey, version }
+                    };
+                    actions.Lists.Set(Constants.RavenDeletedIndexesVersions, instance.Name, metadata, UuidType.Indexing);
+                });
 
                 // We raise the notification now because as far as we're concerned it is done *now*
                 TransactionalStorage.ExecuteImmediatelyOrRegisterForSynchronization(() =>
@@ -989,6 +1099,32 @@ namespace Raven.Database.Actions
                         Version = instance.IndexVersion
                     })
                 );
+            }
+        }
+
+        private void PrepareIndexDeletion(int indexId)
+        {
+            var retries = 0;
+            while (true)
+            {
+                try
+                {
+                    TransactionalStorage.Batch(actions => actions.Indexing.PrepareIndexForDeletion(indexId));
+                    return;
+                }
+                catch (Exception e)
+                {
+                    if (TransactionalStorageHelper.IsWriteConflict(e, out e))
+                    {
+                        if (++retries >= 10)
+                            throw;
+
+                        Thread.Sleep(100);
+                        continue;
+                    }
+
+                    throw;
+                }
             }
         }
 

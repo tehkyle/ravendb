@@ -502,31 +502,33 @@ namespace Raven.Client.Document
             rootServicePoint.ConnectionLimit = 256;
             rootServicePoint.MaxIdleTime = Timeout.Infinite;
 #endif
-
-            databaseCommandsGenerator = () =>
-            {
-                var asyncServerClient = new AsyncServerClient(Url, Conventions, new OperationCredentials(ApiKey, Credentials), jsonRequestFactory,
-                   currentSessionId, GetRequestExecuterForDatabase, GetRequestTimeMetricForUrl, null,
-                   Listeners.ConflictListeners, true);
-
-                var serverClient = new ServerClient(asyncServerClient);
-
-                if (string.IsNullOrEmpty(DefaultDatabase))
-                    return serverClient;
-                return serverClient.ForDatabase(DefaultDatabase);
-            };
-
             asyncDatabaseCommandsGenerator = () =>
             {
-                var asyncServerClient = new AsyncServerClient(Url, Conventions, new OperationCredentials(ApiKey, Credentials), 
-                    jsonRequestFactory,currentSessionId, 
-                    GetRequestExecuterForDatabase, GetRequestTimeMetricForUrl, null,
-                    Listeners.ConflictListeners, true);
+                AsyncServerClient asyncDatabaseCommand;
+                // we have a non-system database if we stated a default database that is not a system database or if we have a predefined url
+                if (string.IsNullOrEmpty(DefaultDatabase) == false && DefaultDatabase != Constants.SystemDatabase || Url != rootDatabaseUrl)
+                {
+                    var databaseUrl = Url;
+                    if (string.IsNullOrEmpty(DefaultDatabase) == false)
+                        databaseUrl = rootDatabaseUrl + "/databases/" + DefaultDatabase;
 
-                if (string.IsNullOrEmpty(DefaultDatabase))
-                    return asyncServerClient;
-                return asyncServerClient.ForDatabase(DefaultDatabase);
+                    asyncDatabaseCommand = new AsyncServerClient(databaseUrl, Conventions, new OperationCredentials(ApiKey, Credentials), jsonRequestFactory,
+                        currentSessionId, GetRequestExecuterForDatabase, GetRequestTimeMetricForUrl, DefaultDatabase,
+                        Listeners.ConflictListeners, true);
+                }
+                else
+                {
+                    asyncDatabaseCommand = new AsyncServerClient(rootDatabaseUrl, Conventions,
+                        new OperationCredentials(ApiKey, Credentials),
+                        jsonRequestFactory, currentSessionId,
+                        GetRequestExecuterForDatabase, GetRequestTimeMetricForUrl, Constants.SystemDatabase, Listeners.ConflictListeners, true);
+                }
+                asyncDatabaseCommand.AvoidCluster = AvoidCluster;
+                return asyncDatabaseCommand;
             };
+            databaseCommandsGenerator = () => new ServerClient((AsyncServerClient)asyncDatabaseCommandsGenerator());
+
+           
         }
 
         public IDocumentStoreReplicationInformer GetReplicationInformerForDatabase(string dbName = null)
@@ -543,7 +545,7 @@ namespace Raven.Client.Document
             if (FailoverServers == null)
                 return result;
 
-            if (dbName == DefaultDatabase)
+            if (dbName == DefaultDatabase || DefaultDatabase == null && dbName == Constants.SystemDatabase)
             {
                 if (FailoverServers.IsSetForDefaultDatabase && result.FailoverServers == null)
                     result.FailoverServers = FailoverServers.ForDefaultDatabase;
@@ -557,10 +559,13 @@ namespace Raven.Client.Document
             return result;
         }
 
+        public bool AvoidCluster { get; set; } = false;
+
         private IRequestExecuter GetRequestExecuterForDatabase(AsyncServerClient serverClient, string databaseName, 
             bool incrementStrippingBase)
         {
             var key = Url;
+            databaseName = databaseName ?? DefaultDatabase;
             if (string.IsNullOrEmpty(databaseName) == false)
                 key = MultiDatabase.GetRootDatabaseUrl(Url) + "/databases/" + databaseName;
 
@@ -569,10 +574,14 @@ namespace Raven.Client.Document
             IRequestExecuter requestExecuter;
             IRequestExecuter originalRequestExecuter=null;
 
-            if (Conventions.FailoverBehavior == FailoverBehavior.ReadFromLeaderWriteToLeader
+            if (AvoidCluster == false && 
+                (
+                Conventions.FailoverBehavior == FailoverBehavior.ReadFromLeaderWriteToLeader
                 || Conventions.FailoverBehavior == FailoverBehavior.ReadFromLeaderWriteToLeaderWithFailovers
                 || Conventions.FailoverBehavior == FailoverBehavior.ReadFromAllWriteToLeader
-                || Conventions.FailoverBehavior == FailoverBehavior.ReadFromAllWriteToLeaderWithFailovers)
+                || Conventions.FailoverBehavior == FailoverBehavior.ReadFromAllWriteToLeaderWithFailovers
+                )
+               )
             {
                 requestExecuter = clusterAwareRequestExecuters.GetOrAdd(key, url => new ClusterAwareRequestExecuter());
                 if (originalKey != key)
@@ -597,7 +606,7 @@ namespace Raven.Client.Document
             if (FailoverServers == null)
                 return requestExecuter;
 
-            if (databaseName == DefaultDatabase)
+            if (databaseName == DefaultDatabase || DefaultDatabase==null && databaseName == Constants.SystemDatabase)
             {
                 if (FailoverServers.IsSetForDefaultDatabase && requestExecuter.FailoverServers == null)
                     requestExecuter.FailoverServers = FailoverServers.ForDefaultDatabase;

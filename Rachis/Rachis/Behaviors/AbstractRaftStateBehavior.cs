@@ -6,6 +6,7 @@ using System.Linq;
 using Rachis.Commands;
 using Rachis.Messages;
 using Rachis.Storage;
+using Rachis.Transport;
 using Raven.Abstractions.Extensions;
 using Raven.Abstractions.Logging;
 
@@ -31,14 +32,14 @@ namespace Rachis.Behaviors
         private DateTime lastHeartbeatTime;
         private readonly Dictionary<Type, Action<MessageContext>> _actionDispatch;
 
-        protected bool FromOurTopology(BaseMessage msg)
+        protected bool FromOurTopology(BaseMessage msg, bool acceptWhenTopologyIsEmpty = true)
         {
             if (msg.ClusterTopologyId == Engine.CurrentTopology.TopologyId)
                 return true;
 
             // if we don't have the same topology id, maybe we have _no_ topology, if that is the case,
             // we are accepting the new topology id immediately
-            if (Engine.CurrentTopology.TopologyId == Guid.Empty && 
+            if (acceptWhenTopologyIsEmpty && Engine.CurrentTopology.TopologyId == Guid.Empty && 
                 Engine.CurrentTopology.HasVoters == false)
             {
                 var tcc = new TopologyChangeCommand
@@ -202,7 +203,8 @@ namespace Rachis.Behaviors
 
         public RequestVoteResponse Handle(RequestVoteRequest req)
         {
-            if (FromOurTopology(req) == false)
+            //We don't vote for nodes when we have no topology!
+            if (FromOurTopology(req, acceptWhenTopologyIsEmpty:false) == false)
             {
                 _log.Info("Got a request vote message outside my cluster topology (id: {0}), ignoring", req.ClusterTopologyId);
                 return new RequestVoteResponse
@@ -287,7 +289,9 @@ namespace Rachis.Behaviors
             }
 
             if (Engine.PersistentState.VotedFor != null && Engine.PersistentState.VotedFor != req.From &&
-                Engine.PersistentState.VotedForTerm >= req.Term)
+                Engine.PersistentState.VotedForTerm >= req.Term  &&
+                //This is the case where we voted for a node and right after were not able to communicate to is
+                DateTime.UtcNow - LastHeartbeatTime < TimeSpan.FromMilliseconds(10 * Engine.Options.ElectionTimeout))
             {
                 var msg = string.Format("Rejecting request vote because already voted for {0} in term {1}",
                     Engine.PersistentState.VotedFor, req.Term);
@@ -416,6 +420,8 @@ namespace Rachis.Behaviors
 
         public virtual AppendEntriesResponse Handle(AppendEntriesRequest req)
         {
+            var lastLogIndex = Engine.PersistentState.LastLogEntry().Index;
+
             if (FromOurTopology(req) == false)
             {
                 _log.Info("Got an append entries message outside my cluster topology (id: {0}), ignoring", req.ClusterTopologyId);
@@ -423,7 +429,7 @@ namespace Rachis.Behaviors
                 {
                     Success = false,
                     CurrentTerm = Engine.PersistentState.CurrentTerm,
-                    LastLogIndex = Engine.PersistentState.LastLogEntry().Index,
+                    LastLogIndex = lastLogIndex,
                     LeaderId = Engine.CurrentLeader,
                     Message = "Cannot accept append entries from a node outside my cluster. My topology id is: " + Engine.CurrentTopology.TopologyId,
                     From = Engine.Name,
@@ -443,7 +449,7 @@ namespace Rachis.Behaviors
                 {
                     Success = false,
                     CurrentTerm = Engine.PersistentState.CurrentTerm,
-                    LastLogIndex = Engine.PersistentState.LastLogEntry().Index,
+                    LastLogIndex = lastLogIndex,
                     LeaderId = Engine.CurrentLeader,
                     Message = msg,
                     From = Engine.Name,
@@ -465,17 +471,22 @@ namespace Rachis.Behaviors
             var prevTerm = Engine.PersistentState.TermFor(req.PrevLogIndex) ?? 0;
             if (prevTerm != req.PrevLogTerm)
             {
-                var msg = string.Format(
-                    "Rejecting append entries because msg previous term {0} is not the same as the persisted current term {1} at log index {2}",
-                    req.PrevLogTerm, prevTerm, req.PrevLogIndex);
+                var midpointIndex = req.PrevLogIndex / 2;
+                var midpointTerm = Engine.PersistentState.TermFor(midpointIndex) ?? 0;
+
+                var msg = $"Rejecting append entries because msg previous term {req.PrevLogTerm} is not the same as the persisted current term {prevTerm}" +
+                          $" at log index {req.PrevLogIndex}. Midpoint index {midpointIndex}, midpoint term: {midpointTerm}";
                 _log.Info(msg);
+                
                 return new AppendEntriesResponse
                 {
                     Success = false,
                     CurrentTerm = Engine.PersistentState.CurrentTerm,
-                    LastLogIndex = Engine.PersistentState.LastLogEntry().Index,
+                    LastLogIndex = req.PrevLogIndex,
                     Message = msg,
                     LeaderId = Engine.CurrentLeader,
+                    MidpointIndex = midpointIndex,
+                    MidpointTerm = midpointTerm,
                     From = Engine.Name,
                     ClusterTopologyId = Engine.CurrentTopology.TopologyId,
                 };
@@ -483,6 +494,15 @@ namespace Rachis.Behaviors
 
             LastHeartbeatTime = DateTime.UtcNow;
             LastMessageTime = DateTime.UtcNow;
+
+            var appendEntriesResponse = new AppendEntriesResponse
+            {
+                Success = true,
+                CurrentTerm = Engine.PersistentState.CurrentTerm,
+                From = Engine.Name,
+                ClusterTopologyId = Engine.CurrentTopology.TopologyId,
+            };
+
             if (req.Entries.Length > 0)
             {
                 if (_log.IsDebugEnabled)
@@ -510,11 +530,56 @@ namespace Rachis.Behaviors
                     skip++;
                 }
 
+
+                var topologyChange = req.Entries.Skip(skip).LastOrDefault(x => x.IsTopologyChange == true);
+
+                if (topologyChange != null)
+                {
+                    var command = Engine.PersistentState.CommandSerializer.Deserialize(topologyChange.Data);
+                    var topologyChangeCommand = command as TopologyChangeCommand;
+
+                    if (topologyChangeCommand != null && topologyChangeCommand.Requested.AllNodes.Select(x=>x.Name).Contains(Engine.Options.SelfConnection.Name) == false)
+                    {
+                        _log.Warn("Got topology without self, disconnecting from the leader, clearing topology and moving to leader state");
+                        var tcc = new TopologyChangeCommand
+                        {
+                            Requested = new Topology(Guid.NewGuid(), new[] { Engine.Options.SelfConnection }, new List<NodeConnectionInfo>(), new List<NodeConnectionInfo>())
+                        };
+                        Engine.PersistentState.SetCurrentTopology(tcc.Requested, 0L);
+                        Engine.StartTopologyChange(tcc);
+                        Engine.CommitTopologyChange(tcc);
+                        Engine.SetState(RaftEngineState.Leader);
+
+                        return new AppendEntriesResponse
+                        {
+                            Success = true,
+                            CurrentTerm = Engine.PersistentState.CurrentTerm,
+                            LastLogIndex = lastLogIndex,
+                            Message = "Leaving cluster, because received topology from the leader that didn't contain us",
+                            From = Engine.Name,
+                            ClusterTopologyId = req.ClusterTopologyId, // we send this "older" ID, so the leader won't reject us
+                        };
+                    }
+                }
+
                 if (skip != req.Entries.Length)
+                {
                     Engine.PersistentState.AppendToLog(Engine, req.Entries.Skip(skip), req.PrevLogIndex + skip);
+                }
+                else
+                {
+                    // if we skipped the whole thing, this is fine, but let us hint to the leader that we are more 
+                    // up to date then it thinks
+                    var lastReceivedIndex = req.Entries[req.Entries.Length - 1].Index;
+                    appendEntriesResponse.MidpointIndex = lastReceivedIndex + (lastLogIndex - lastReceivedIndex) / 2;
+                    appendEntriesResponse.MidpointTerm = Engine.PersistentState.TermFor(appendEntriesResponse.MidpointIndex.Value) ?? 0;
 
-                var topologyChange = req.Entries.LastOrDefault(x => x.IsTopologyChange == true);
+                    _log.Info($"Got {req.Entries.Length} entires from index {req.Entries[0].Index} with term {req.Entries[0].Term} skipping all. " +
+                              $"Setting midpoint index to {appendEntriesResponse.MidpointIndex} with term {appendEntriesResponse.MidpointTerm}.");
+                }
 
+
+                
                 // we consider the latest topology change to be in effect as soon as we see it, even before the 
                 // it is committed, see raft spec section 6:
                 //		a server always uses the latest con?guration in its log, 
@@ -527,7 +592,7 @@ namespace Rachis.Behaviors
                         //if this is true --> it is a serious issue and should be fixed immediately!
                         throw new InvalidOperationException(@"Log entry that is marked with IsTopologyChange should be of type TopologyChangeCommand.
                                                             Instead, it is of type: " + command.GetType() + ". It is probably a bug!");
-
+                    
                     _log.Info("Topology change started (TopologyChangeCommand committed to the log): {0}",
                         topologyChangeCommand.Requested);
                     Engine.PersistentState.SetCurrentTopology(topologyChangeCommand.Requested, topologyChange.Index);
@@ -536,7 +601,7 @@ namespace Rachis.Behaviors
             }
 
             var lastIndex = req.Entries.Length == 0 ?
-                Engine.PersistentState.LastLogEntry().Index :
+                lastLogIndex :
                 req.Entries[req.Entries.Length - 1].Index;
             try
             {				
@@ -546,14 +611,8 @@ namespace Rachis.Behaviors
                     CommitEntries(req.Entries, nextCommitIndex);
                 }
 
-                return new AppendEntriesResponse
-                {
-                    Success = true,
-                    CurrentTerm = Engine.PersistentState.CurrentTerm,
-                    LastLogIndex = Engine.PersistentState.LastLogEntry().Index,
-                    From = Engine.Name,
-                    ClusterTopologyId = Engine.CurrentTopology.TopologyId,
-                };
+                appendEntriesResponse.LastLogIndex = lastLogIndex;
+                return appendEntriesResponse;
             }
             catch (Exception e)
             {
@@ -561,7 +620,7 @@ namespace Rachis.Behaviors
                 {
                     Success = false,
                     CurrentTerm = Engine.PersistentState.CurrentTerm,
-                    LastLogIndex = Engine.PersistentState.LastLogEntry().Index,
+                    LastLogIndex = lastLogIndex,
                     Message = "Failed to apply new entries. Reason: " + e,
                     From = Engine.Name,
                     ClusterTopologyId = Engine.CurrentTopology.TopologyId,

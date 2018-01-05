@@ -15,7 +15,7 @@ using System.Threading.Tasks;
 using Lextm.SharpSnmpLib;
 using Lextm.SharpSnmpLib.Messaging;
 using Lextm.SharpSnmpLib.Pipeline;
-
+using Lextm.SharpSnmpLib.Security;
 using Raven.Abstractions.Data;
 using Raven.Abstractions.Logging;
 using Raven.Database.Commercial;
@@ -23,7 +23,6 @@ using Raven.Database.Plugins.Builtins.Monitoring.Snmp.Objects.Database;
 using Raven.Database.Plugins.Builtins.Monitoring.Snmp.Objects.Server;
 using Raven.Database.Server;
 using Raven.Database.Server.Tenancy;
-using Raven.Database.Util;
 using Raven.Json.Linq;
 
 namespace Raven.Database.Plugins.Builtins.Monitoring.Snmp
@@ -120,6 +119,8 @@ namespace Raven.Database.Plugins.Builtins.Monitoring.Snmp
             var factory = new SnmpApplicationFactory(new Logger(log), store, membershipProvider, messageHandlerFactory);
 
             var listener = new Listener();
+            listener.Users.Add(new User(new OctetString("ravendb"), new DefaultPrivacyProvider(new SHA1AuthenticationProvider(new OctetString(configuration.Monitoring.Snmp.Community)))));
+
             var engineGroup = new EngineGroup();
 
             var engine = new SnmpEngine(factory, listener, engineGroup);
@@ -177,7 +178,7 @@ namespace Raven.Database.Plugins.Builtins.Monitoring.Snmp
         {
             var index = (int)GetOrAddDatabaseIndex(databaseName);
 
-            loadedDatabases.GetOrAdd(databaseName, new SnmpDatabase(databaseLandlord, store, databaseName, index));
+            loadedDatabases.GetOrAdd(databaseName, _ => new SnmpDatabase(databaseLandlord, store, databaseName, index));
         }
 
         private long GetOrAddDatabaseIndex(string databaseName)

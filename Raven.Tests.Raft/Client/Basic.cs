@@ -136,8 +136,11 @@ namespace Raven.Tests.Raft.Client
                 }
 
                 SetupClusterConfiguration(clusterStores);
-
-                clusterStores.ForEach(store => AsyncHelpers.RunSync(()=>((ServerClient)store.DatabaseCommands).RequestExecuter.UpdateReplicationInformationIfNeededAsync((AsyncServerClient)store.AsyncDatabaseCommands, force: true)));
+                foreach (var s in clusterStores)
+                {
+                    var re = ((ServerClient) s.DatabaseCommands).RequestExecuter;
+                    AsyncHelpers.RunSync(() => re.UpdateReplicationInformationIfNeededAsync((AsyncServerClient) s.AsyncDatabaseCommands, force: true));
+                }                
 
 
                 var leader = servers.First(x => x.Options.ClusterManager.Value.IsLeader());
@@ -167,15 +170,11 @@ namespace Raven.Tests.Raft.Client
                     store.Conventions.FailoverBehavior = FailoverBehavior.ReadFromLeaderWriteToLeader;
                 });
 
-                foreach (var documentStore in clusterStores)
-                {
-                    // set lower timeout to reduce test time
-                    documentStore.JsonRequestFactory.RequestTimeout = TimeSpan.FromSeconds(5);
-                }
-
                 SetupClusterConfiguration(clusterStores);
 
-                clusterStores.ForEach(store => ((ServerClient)store.DatabaseCommands).RequestExecuter.UpdateReplicationInformationIfNeededAsync((AsyncServerClient)store.AsyncDatabaseCommands, force: true));
+                clusterStores.ForEach(store => 
+                    AsyncHelpers.RunSync(()=>
+                        ((ServerClient)store.DatabaseCommands).RequestExecuter.UpdateReplicationInformationIfNeededAsync((AsyncServerClient)store.AsyncDatabaseCommands, force: true)));
 
                 for (int i = 0; i < clusterStores.Count; i++)
                 {
@@ -192,6 +191,8 @@ namespace Raven.Tests.Raft.Client
                 servers
                     .First(x => x.Options.ClusterManager.Value.IsLeader())
                     .Dispose();
+
+
 
                 for (int i = 0; i < clusterStores.Count; i++)
                 {
@@ -449,7 +450,7 @@ namespace Raven.Tests.Raft.Client
             response = await httpClient.PostAsync(url + "/facets/facet1", new JsonContent());
             assertion(response);
 
-            response = await httpClient.PostAsync(url + "/facets/multisearch", new JsonContent());
+            response = await httpClient.PostAsync(url + "/facets-multisearch", new JsonContent());
             assertion(response);
         }
 

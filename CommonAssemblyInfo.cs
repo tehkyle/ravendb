@@ -1,18 +1,18 @@
-﻿using System;
+using System;
 using System.Reflection;
 using System.Resources;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
 [assembly: AssemblyCompany("Hibernating Rhinos")]
-[assembly: AssemblyCopyright("© Hibernating Rhinos 2004 - 2016 All rights reserved.")]
+[assembly: AssemblyCopyright("© Hibernating Rhinos 2004 - 2017 All rights reserved.")]
 [assembly: AssemblyTrademark("")]
 [assembly: ComVisible(false)]
 [assembly: CLSCompliant(true)]
 [assembly: AssemblyTitle("RavenDB")]
-[assembly: AssemblyVersion("3.5.0")]
-[assembly: AssemblyFileVersion("3.5.0.13")]
-[assembly: AssemblyInformationalVersion("3.5.0")]
+[assembly: AssemblyVersion("3.5.5")]
+[assembly: AssemblyFileVersion("3.5.5.13")]
+[assembly: AssemblyInformationalVersion("3.5.5")]
 [assembly: AssemblyProduct("RavenDB")]
 [assembly: AssemblyDescription("RavenDB is a second generation LINQ enabled document database for .NET")]
 

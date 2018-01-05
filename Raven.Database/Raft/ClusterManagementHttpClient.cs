@@ -59,7 +59,8 @@ namespace Raven.Database.Raft
                 var dispose = (IDisposable)GetConnection(info, out client);
                 return Tuple.Create(dispose, client);
             },
-            CancellationToken.None)
+            CancellationToken.None,
+                raftEngine.GetLogger())
             {
                 UnauthorizedResponseAsyncHandler = HandleUnauthorizedResponseAsync,
                 ForbiddenResponseAsyncHandler = HandleForbiddenResponseAsync
@@ -239,7 +240,7 @@ namespace Raven.Database.Raft
             }
         }
 
-        public async Task<ConnectivityStatus> CheckConnectivity(NodeConnectionInfo node)
+        public async Task<Tuple<ConnectivityStatus, string>> CheckConnectivity(NodeConnectionInfo node)
         {
             try
             {
@@ -247,22 +248,23 @@ namespace Raven.Database.Raft
                 using (var request = CreateRequest(node, url, HttpMethods.Get))
                 {
                     var response = await request.ExecuteAsync().ConfigureAwait(false);
-                    return response.IsSuccessStatusCode ? ConnectivityStatus.Online : ConnectivityStatus.Offline;
+                    return response.IsSuccessStatusCode ? Tuple.Create(ConnectivityStatus.Online,string.Empty) : Tuple.Create(ConnectivityStatus.Offline, await response.Content.ReadAsStringAsync().ConfigureAwait(false));
+                    
                 }
             }
             catch (ErrorResponseException e)
             {
-                return e.StatusCode == HttpStatusCode.Unauthorized ? ConnectivityStatus.WrongCredentials : ConnectivityStatus.Offline;
+                return Tuple.Create(e.StatusCode == HttpStatusCode.Unauthorized ? ConnectivityStatus.WrongCredentials : ConnectivityStatus.Offline, e.ToString());
             }
-            catch (Exception)
+            catch (Exception e)
             {
-                return ConnectivityStatus.Offline;
+                return Tuple.Create(ConnectivityStatus.Offline,e.ToString());
             }
         }
 
         private async Task SendDatabaseDeleteInternalAsync(NodeConnectionInfo node, string databaseName, bool hardDelete)
         {
-            var url = node.GetAbsoluteUri() + "admin/cluster/commands/database/" + Uri.EscapeDataString(databaseName) + "?hardDelete=" + hardDelete;
+            var url = node.GetAbsoluteUri() + "admin/cluster/commands/database/" + Uri.EscapeDataString(databaseName) + "?hard-delete=" + hardDelete;
             using (var request = CreateRequest(node, url, HttpMethods.Delete))
             {
                 var response = await request.ExecuteAsync().ConfigureAwait(false);
@@ -358,24 +360,12 @@ namespace Raven.Database.Raft
                 if (raftEngine.Options.SelfConnection == node)
                 {
                     await raftEngine.StepDownAsync().ConfigureAwait(false);
-                    raftEngine.WaitForLeader();
+                    raftEngine.WaitForLeaderConfirmed();
                 }
                 else
                 {
-                    // before we send remove from cluster wait until configuration will be propaged
-                    // to avoid: Cannot modify the cluster topology when the committed index ___ is in term ___ but the current term is ___
-                    // Wait until the leader finishes committing entries from the current term and try again
-                    await Task.Delay(raftEngine.Options.HeartbeatTimeout * 2).ConfigureAwait(false);
-
                     // remove node from cluster by excluding it from topology
                     await raftEngine.RemoveFromClusterAsync(node).ConfigureAwait(false);
-
-                    // since both remove from cluster and sendInitialize new cluster are send from current leader
-                    // we have to wait for first topology to apply on removing node
-                    await Task.Delay(raftEngine.Options.HeartbeatTimeout*2).ConfigureAwait(false);
-
-                    // send information to leaved node to create new single node topology
-                    await SendInitializeNewClusterForAsync(node).ConfigureAwait(false);
                     return;
                 }
             }
@@ -467,9 +457,9 @@ namespace Raven.Database.Raft
             }
         }
 
-        public async Task SendInitializeNewClusterForAsync(NodeConnectionInfo node, Guid? clusterId = null)
+        public async Task SendInitializeNewClusterForAsync(NodeConnectionInfo node)
         {
-            var url = node.GetAbsoluteUri() + "admin/cluster/initialize-new-cluster" + (clusterId.HasValue ? "?id=" + clusterId.Value : string.Empty);
+            var url = node.GetAbsoluteUri() + "admin/cluster/initialize-new-cluster";
 
             using (var request = CreateRequest(node, url, HttpMethods.Patch))
             {

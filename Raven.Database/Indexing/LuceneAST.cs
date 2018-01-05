@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Text;
 using Lucene.Net.Analysis.Tokenattributes;
 using Lucene.Net.Index;
@@ -26,16 +27,12 @@ namespace Raven.Database.Indexing
 
         public abstract Query ToQuery(LuceneASTQueryConfiguration configuration);
 
-        public virtual void AddQueryToBooleanQuery(BooleanQuery b, LuceneASTQueryConfiguration configuration, Occur o, bool letChildrenDecide = false)
-        {
-            var oc = letChildrenDecide ? GetDefaultOccurFromConfiguration(configuration) : o;
-            b.Add(ToQuery(configuration), oc);
-        }
 
-        protected static Occur GetDefaultOccurFromConfiguration(LuceneASTQueryConfiguration configuration)
+        public virtual void AddQueryToBooleanQuery(BooleanQuery b, LuceneASTQueryConfiguration configuration, Occur o)
         {
-            if(configuration.DefaultOperator == QueryOperator.And) return Occur.MUST;
-            return Occur.SHOULD;
+            var query = ToQuery(configuration);
+            if(query != null)
+                b.Add(query, o);
         }
 
         public virtual Query ToGroupFieldQuery(LuceneASTQueryConfiguration configuration)
@@ -293,15 +290,28 @@ This edge-case has a very slim chance of happening, but still we should not igno
             }
             if (Type == TermType.PrefixTerm)
             {
-                var actualTerm = string.Empty;
                 if (terms.Count != 0)
                 {
                     var first = terms.First();
-                    actualTerm = first[first.Length - 1] == '*' ? first.Substring(0, first.Length - 1) : first;
+                    var actualTerm = first[first.Length - 1] == '*' ? first.Substring(0, first.Length - 1) : first;
+                    return new PrefixQuery(new Term(configuration.FieldName, actualTerm)) { Boost = boost };
                 }
-                return new PrefixQuery(new Term(configuration.FieldName,actualTerm)) { Boost = boost };
+                // if the term that we are trying to prefix has been removed entirely by the analyzer, then we are going
+                // to cheat a bit, and check for both the term in as specified and the term in lower case format so we can
+                // find it regardless of casing
+                var removeStar = Term.Substring(0, Term.Length-1);
+                var booleanQuery = new BooleanQuery
+                {
+                    Clauses =
+                    {
+                        new BooleanClause(new PrefixQuery(new Term(configuration.FieldName, removeStar )),Occur.SHOULD),
+                        new BooleanClause(new PrefixQuery(new Term(configuration.FieldName, removeStar.ToLowerInvariant())),Occur.SHOULD),
+                    },
+                    Boost = boost
+                };
+                return booleanQuery;
             }
-            if (terms.Count == 0) return new BooleanQuery();
+            if (terms.Count == 0) return null;
 
             if (Type == TermType.Quoted)
             {
@@ -464,8 +474,8 @@ This edge-case has a very slim chance of happening, but still we should not igno
                 return new WildcardQuery(new Term(configuration.FieldName, "*"));
             }
             return new TermRangeQuery(configuration.FieldName,
-                        RangeMin.Type == TermLuceneASTNode.TermType.Null ? null : RangeMin.Term,
-                        RangeMax.Type == TermLuceneASTNode.TermType.Null ? null : RangeMax.Term,
+                        RangeMin.Type == TermLuceneASTNode.TermType.Null || RangeMin.Term.Equals("*") ? null : RangeMin.Term,
+                        RangeMax.Type == TermLuceneASTNode.TermType.Null || RangeMax.Term.Equals("*") ? null : RangeMax.Term,
                         InclusiveMin, InclusiveMax);
         }
 
@@ -516,11 +526,30 @@ This edge-case has a very slim chance of happening, but still we should not igno
 
     public class OperatorLuceneASTNode : LuceneASTNodeBase
     {
-        public OperatorLuceneASTNode(LuceneASTNodeBase leftNode, LuceneASTNodeBase rightNode, Operator op)
+        public OperatorLuceneASTNode(LuceneASTNodeBase leftNode, LuceneASTNodeBase rightNode, Operator op, bool isDefaultOperatorAnd)
         {
-            LeftNode = leftNode;
-            RightNode = rightNode;
-            Op = op;
+            var rightHandBooleanNode = rightNode as OperatorLuceneASTNode;
+            //This basically say that if we have a nested boolean query and the child boolean is not an OR operation do nothing special.
+            if (rightHandBooleanNode == null || 
+                rightHandBooleanNode.Op == Operator.AND || 
+                rightHandBooleanNode.Op == Operator.INTERSECT || 
+                (rightHandBooleanNode.Op == Operator.Implicit && isDefaultOperatorAnd))
+            {
+                LeftNode = leftNode;
+                RightNode = rightNode;
+                Op = op;
+            }
+            //if we are in this case we are a boolean query with a child who is a boolean query with an OR operator .
+            //we shall roll the nodes so (A) and (B or C) will become (A and b) or (C).
+            else
+            {
+                LeftNode = new OperatorLuceneASTNode(leftNode, rightHandBooleanNode.LeftNode, op, isDefaultOperatorAnd);
+                RightNode = rightHandBooleanNode.RightNode;
+                Op = Operator.OR;
+                //this should not be used but if it does a NRE exception will be thrown and it would be easy to locate it.
+                rightHandBooleanNode.RightNode = null;
+                rightHandBooleanNode.LeftNode = null;
+            }
         }
         public override IEnumerable<LuceneASTNodeBase> Children
         {
@@ -532,6 +561,7 @@ This edge-case has a very slim chance of happening, but still we should not igno
         public override Query ToQuery(LuceneASTQueryConfiguration configuration)
         {
             var query = new BooleanQuery();
+            bool hasExplicitPrefix;
             switch (Op)
             {
                 case Operator.AND:
@@ -541,9 +571,6 @@ This edge-case has a very slim chance of happening, but still we should not igno
                 case Operator.OR:
                     LeftNode.AddQueryToBooleanQuery(query, configuration, PrefixToOccurance(LeftNode, Occur.SHOULD));
                     RightNode.AddQueryToBooleanQuery(query, configuration, PrefixToOccurance(RightNode, Occur.SHOULD));
-                    break;
-                case Operator.NOT:
-                    query.Add(LeftNode.ToQuery(configuration), Occur.MUST_NOT);
                     break;
                 case Operator.Implicit:
                     switch (configuration.DefaultOperator)
@@ -571,7 +598,7 @@ This edge-case has a very slim chance of happening, but still we should not igno
         }
 
         private Occur PrefixToOccurance(LuceneASTNodeBase node, Occur defaultOccurance)
-        {
+        {             
             switch (node.Prefix)
             {
                 case PrefixOperator.None:
@@ -585,30 +612,27 @@ This edge-case has a very slim chance of happening, but still we should not igno
             }
         }
 
-        public override void AddQueryToBooleanQuery(BooleanQuery query, LuceneASTQueryConfiguration configuration, Occur o, bool letChildrenDecide = false)
+        public override void AddQueryToBooleanQuery(BooleanQuery query, LuceneASTQueryConfiguration configuration, Occur o)
         {
             switch (Op)
             {
                 case Operator.AND:
-                    LeftNode.AddQueryToBooleanQuery(query, configuration, PrefixToOccurance(LeftNode, letChildrenDecide? Occur.MUST:o));
+                    LeftNode.AddQueryToBooleanQuery(query, configuration, PrefixToOccurance(LeftNode, Occur.MUST));
                     RightNode.AddQueryToBooleanQuery(query, configuration, PrefixToOccurance(RightNode, Occur.MUST));
                     break;
                 case Operator.OR:
-                    LeftNode.AddQueryToBooleanQuery(query, configuration, PrefixToOccurance(LeftNode, letChildrenDecide ? Occur.SHOULD : o));
+                    LeftNode.AddQueryToBooleanQuery(query, configuration, PrefixToOccurance(LeftNode, Occur.SHOULD));
                     RightNode.AddQueryToBooleanQuery(query, configuration, PrefixToOccurance(RightNode, Occur.SHOULD));
-                    break;
-                case Operator.NOT:
-                    query.Add(LeftNode.ToQuery(configuration), Occur.MUST_NOT);
                     break;
                 case Operator.Implicit:
                     switch (configuration.DefaultOperator)
                     {
                         case QueryOperator.Or:
-                            LeftNode.AddQueryToBooleanQuery(query, configuration, PrefixToOccurance(LeftNode, letChildrenDecide ? Occur.SHOULD : o));
+                            LeftNode.AddQueryToBooleanQuery(query, configuration, PrefixToOccurance(LeftNode,Occur.SHOULD));
                             RightNode.AddQueryToBooleanQuery(query, configuration, PrefixToOccurance(RightNode, Occur.SHOULD));
                             break;
                         case QueryOperator.And:
-                            LeftNode.AddQueryToBooleanQuery(query, configuration, PrefixToOccurance(LeftNode, letChildrenDecide ? Occur.MUST : o));
+                            LeftNode.AddQueryToBooleanQuery(query, configuration, PrefixToOccurance(LeftNode, Occur.MUST));
                             RightNode.AddQueryToBooleanQuery(query, configuration, PrefixToOccurance(RightNode, Occur.MUST));
                             break;
                         default:
@@ -616,7 +640,7 @@ This edge-case has a very slim chance of happening, but still we should not igno
                     }
                     break;
                 case Operator.INTERSECT:
-                    LeftNode.AddQueryToBooleanQuery(query, configuration, PrefixToOccurance(LeftNode, letChildrenDecide ? Occur.MUST : o));
+                    LeftNode.AddQueryToBooleanQuery(query, configuration, PrefixToOccurance(LeftNode, Occur.MUST));
                     RightNode.AddQueryToBooleanQuery(query, configuration, PrefixToOccurance(RightNode, Occur.MUST));
                     break;
                 default:
@@ -628,7 +652,6 @@ This edge-case has a very slim chance of happening, but still we should not igno
         {
             AND,
             OR,
-            NOT,
             Implicit,
             INTERSECT
         }
@@ -639,10 +662,6 @@ This edge-case has a very slim chance of happening, but still we should not igno
         public Operator Op { get; set; }
         public override string ToString()
         {
-            if (Op == Operator.NOT)
-            {
-                return "NOT " + LeftNode.ToString();
-            }
             if (Op == Operator.Implicit)
             {
                 return LeftNode + " " + RightNode;
@@ -660,16 +679,22 @@ This edge-case has a very slim chance of happening, but still we should not igno
         public override Query ToQuery(LuceneASTQueryConfiguration configuration)
         {
             var query = new BooleanQuery();
-            //Here the Occur.MUST is ignored we will use the default occur in children nodes
-            Node.AddQueryToBooleanQuery(query, configuration, Occur.MUST,true); 
-            query.Boost = Boost == null ? 1 : float.Parse(Boost);
+            var occur = configuration.DefaultOperator == QueryOperator.And ? Occur.MUST : Occur.SHOULD;
+            //if the node is boolean query than it is going to ignore this value.
+            Node.AddQueryToBooleanQuery(query, configuration, occur); 
+            query.Boost = GetBoost();
             return query;
         }
 
         public override Query ToGroupFieldQuery(LuceneASTQueryConfiguration configuration)
         {
-            return Node.ToQuery(configuration);
+            var query = Node.ToQuery(configuration);
+            if (query == null)
+                return null;
+            query.Boost = GetBoost();
+            return query;
         }
+
         public LuceneASTNodeBase Node { get; set; }
         public string Boost { get; set; }
         public override string ToString()
@@ -678,6 +703,13 @@ This edge-case has a very slim chance of happening, but still we should not igno
             sb.Append('(').Append(Node).Append(')').Append(string.IsNullOrEmpty(Boost)?string.Empty:string.Format("^{0}",Boost));
             return sb.ToString();
         }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public float GetBoost()
+        {
+            return  Boost == null ? 1 : float.Parse(Boost);;
+        }
+
     }
     public class PostfixModifiers
     {

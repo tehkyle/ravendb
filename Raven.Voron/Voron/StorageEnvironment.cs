@@ -1,12 +1,10 @@
 using Sparrow.Collections;
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
-using System.Runtime.CompilerServices;
 using System.Runtime.ExceptionServices;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -14,7 +12,6 @@ using System.Threading.Tasks;
 using Voron.Debugging;
 using Voron.Exceptions;
 using Voron.Impl;
-using Voron.Impl.Backup;
 using Voron.Impl.FileHeaders;
 using Voron.Impl.FreeSpace;
 using Voron.Impl.Journal;
@@ -135,6 +132,7 @@ namespace Voron
             {
                 var root = Tree.Open(tx, header->TransactionId == 0 ? &entry.Root : &header->Root);
                 var freeSpace = Tree.Open(tx, header->TransactionId == 0 ? &entry.FreeSpace : &header->FreeSpace);
+                freeSpace.IsFreeSpaceTree = true;
 
                 tx.UpdateRootsIfNeeded(root, freeSpace);
                 tx.Commit();
@@ -153,6 +151,7 @@ namespace Voron
             {
                 var root = Tree.Create(tx, false);
                 var freeSpace = Tree.Create(tx, false);
+                freeSpace.IsFreeSpaceTree = true;
 
                 // important to first create the two trees, then set them on the env
                 tx.UpdateRootsIfNeeded(root, freeSpace);
@@ -188,6 +187,19 @@ namespace Voron
                 if (largestTx == long.MaxValue)
                     return 0;
                 return largestTx;
+            }
+        }
+
+        public long PossibleOldestReadTransaction
+        {
+            get
+            {
+                var oldestActive = OldestTransaction;
+
+                if (oldestActive == 0)
+                    return CurrentReadTransactionId;
+
+                return Math.Min(CurrentReadTransactionId, oldestActive);
             }
         }
 
@@ -424,7 +436,7 @@ namespace Voron
                 _txCommit.EnterReadLock();
                 try
                 {
-                    long txId = flags == TransactionFlags.ReadWrite ? _transactionsCounter + 1 : _transactionsCounter;
+                    long txId = flags == TransactionFlags.ReadWrite ? NextWriteTransactionId : CurrentReadTransactionId;
                     tx = new Transaction(this, txId, flags, _freeSpaceHandling);
 
                     if (IsDebugRecording)
@@ -432,13 +444,14 @@ namespace Voron
                         RecordTransactionState(tx, DebugActionType.TransactionStart);
                         tx.RecordTransactionState = RecordTransactionState;
                     }
+
+                    _activeTransactions.Add(tx);
                 }
                 finally
                 {
                     _txCommit.ExitReadLock();
                 }
-
-                _activeTransactions.Add(tx);
+                
                 tx.EnsurePagerStateReference(_dataPager.PagerState);
 
                 if (flags == TransactionFlags.ReadWrite)
@@ -461,6 +474,32 @@ namespace Voron
             DebugJournal.RecordTransactionAction(tx, state);
         }
 
+        public long CurrentReadTransactionId
+        {
+            get { return Thread.VolatileRead(ref _transactionsCounter); }
+        }
+
+        internal ExitWriteLock PreventNewReadTransactions()
+        {
+            _txCommit.EnterWriteLock();
+            return new ExitWriteLock(_txCommit);
+        }
+
+        public struct ExitWriteLock : IDisposable
+        {
+            readonly ReaderWriterLockSlim _rwls;
+
+            public ExitWriteLock(ReaderWriterLockSlim rwls)
+            {
+                _rwls = rwls;
+            }
+
+            public void Dispose()
+            {
+                _rwls.ExitWriteLock();
+            }
+        }
+
         public long NextWriteTransactionId
         {
             get { return Thread.VolatileRead(ref _transactionsCounter) + 1; }
@@ -470,18 +509,13 @@ namespace Voron
         {
             if (_activeTransactions.Contains(tx) == false)
                 return;
-            
-            _txCommit.EnterWriteLock();
-            try
+
+            using (PreventNewReadTransactions())
             {
                 if (tx.Committed && tx.FlushedToJournal)
                     _transactionsCounter = tx.Id;
 
                 State = tx.State;
-            }
-            finally
-            {
-                _txCommit.ExitWriteLock();
             }
 
             if (tx.FlushedToJournal == false)
@@ -578,6 +612,8 @@ namespace Voron
                 {
                     FreePagesOverhead = tx.FreeSpaceRoot.State.PageCount,
                     RootPages = tx.Root.State.PageCount,
+                    NumberOfAllocatedPages = _dataPager.NumberOfAllocatedPages,
+                    NextPageNumber = NextPageNumber,
                     UnallocatedPagesAtEndOfFile = _dataPager.NumberOfAllocatedPages - NextPageNumber,
                     UsedDataFileSizeInBytes = (State.NextPageNumber - 1) * AbstractPager.PageSize,
                     AllocatedDataFileSizeInBytes = numberOfAllocatedPages * AbstractPager.PageSize,
@@ -623,7 +659,7 @@ namespace Voron
 
                             try
                             {
-                                _journal.Applicator.ApplyLogsToDataFile(OldestTransaction, _cancellationTokenSource.Token);
+                                _journal.Applicator.ApplyLogsToDataFile(_cancellationTokenSource.Token);
                             }
                             catch (TimeoutException)
                             {
@@ -657,7 +693,7 @@ namespace Voron
                 _debugJournal.RecordFlushAction(DebugActionType.FlushStart, tx);
             }
 
-            _journal.Applicator.ApplyLogsToDataFile(OldestTransaction, _cancellationTokenSource.Token, tx, allowToFlushOverwrittenPages);
+            _journal.Applicator.ApplyLogsToDataFile(_cancellationTokenSource.Token, tx, allowToFlushOverwrittenPages);
 
             if (IsDebugRecording)
             {

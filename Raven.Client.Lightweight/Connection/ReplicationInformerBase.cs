@@ -103,7 +103,7 @@ namespace Raven.Client.Connection
 
         public abstract void ClearReplicationInformationLocalCache(TClient client);
 
-        protected abstract void UpdateReplicationInformationFromDocument(JsonDocument document);
+        public abstract void UpdateReplicationInformationFromDocument(JsonDocument document);
 
         /// <summary>
         /// Should execute the operation using the specified operation URL
@@ -124,10 +124,12 @@ namespace Raven.Client.Connection
             if ((currentTask.IsCompleted || currentTask.IsFaulted || currentTask.IsCanceled) && DelayTimeInMiliSec > 0)
             {
                 var tcs = new TaskCompletionSource<object>();
-
                 var old = Interlocked.CompareExchange(ref failureCounter.CheckDestination, tcs.Task, currentTask);
                 if (old == currentTask)
                 {
+                    if (currentTask.IsCanceled || currentTask.IsFaulted)
+                        GC.KeepAlive(currentTask.Exception); // observer & ignore this exception
+
                     CheckIfServerIsUpNow(operationMetadata, primaryOperation, token)
                         .ContinueWith(task =>
                         {

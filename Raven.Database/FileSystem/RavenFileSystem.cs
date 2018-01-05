@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.ComponentModel.Composition;
 using System.ComponentModel.Composition.Hosting;
 using System.IO;
@@ -29,7 +30,6 @@ using Raven.Database.Impl;
 using Raven.Database.Server.Abstractions;
 using Raven.Database.Server.Connections;
 using Raven.Database.Util;
-using Raven.Abstractions.Threading;
 using Raven.Abstractions;
 using Raven.Database.Common;
 
@@ -52,7 +52,7 @@ namespace Raven.Database.FileSystem
         private readonly TransportState transportState;
         private readonly MetricsCountersManager metricsCounters;
 
-        private readonly Raven.Abstractions.Threading.ThreadLocal<bool> disableAllTriggers = new Raven.Abstractions.Threading.ThreadLocal<bool>(() => false);
+        private readonly ThreadLocal<DisableTriggerState> disableAllTriggers = new ThreadLocal<DisableTriggerState>(() => new DisableTriggerState{Disabled = false});
 
         private volatile bool disposed;
 
@@ -227,7 +227,7 @@ namespace Raven.Database.FileSystem
             }
         }
 
-        internal static ITransactionalStorage CreateTransactionalStorage(InMemoryRavenConfiguration configuration)
+        public static ITransactionalStorage CreateTransactionalStorage(InMemoryRavenConfiguration configuration)
         {
             var storageType = configuration.FileSystem.SelectFileSystemStorageEngineAndFetchTypeName();
 
@@ -243,13 +243,13 @@ namespace Raven.Database.FileSystem
             }
         }
 
-        public IDisposable DisableAllTriggersForCurrentThread()
+        public IDisposable DisableAllTriggersForCurrentThread(HashSet<Type> except = null)
         {
             if (disposed)
                 return new DisposableAction(() => { });
 
-            bool old = disableAllTriggers.Value;
-            disableAllTriggers.Value = true;
+            var old = disableAllTriggers.Value;
+            disableAllTriggers.Value = new DisableTriggerState{Disabled = true, Except = except};
             return new DisposableAction(() =>
             {
                 if (disposed)
@@ -441,6 +441,8 @@ namespace Raven.Database.FileSystem
             if (Files != null)
                 exceptionAggregator.Execute(Files.Dispose);
 
+            exceptionAggregator.Execute(disableAllTriggers.Dispose);
+
             exceptionAggregator.ThrowIfNeeded();
         }
 
@@ -473,7 +475,11 @@ namespace Raven.Database.FileSystem
                 ActiveSyncs = SynchronizationTask.Queue.Active.ToList(),
                 PendingSyncs = SynchronizationTask.Queue.Pending.ToList(),
             };
-            Storage.Batch(accessor => { fsStats.FileCount = accessor.GetFileCount(); });
+            Storage.Batch(accessor =>
+            {
+                fsStats.FileCount = accessor.GetFileCount();
+                fsStats.LastFileEtag = accessor.GetLastEtag();
+            });
             return fsStats;
         }
 

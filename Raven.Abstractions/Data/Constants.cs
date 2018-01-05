@@ -14,6 +14,9 @@ namespace Raven.Abstractions.Data
         public const string ParticipatingIDsPropertyName = "Participating-IDs-Property-Name";
 
         public const string IsReplicatedUrlParamName = "is-replicated";
+        public const string IndexVersion = "index-version";
+        public const string TransformerVersion = "transformer-version";
+
         public const string RavenClientPrimaryServerUrl = "Raven-Client-Primary-Server-Url";
 
         public const string RavenClientPrimaryServerLastCheck = "Raven-Client-Primary-Server-LastCheck";
@@ -21,8 +24,9 @@ namespace Raven.Abstractions.Data
         public const string RavenForcePrimaryServerCheck = "Raven-Force-Primary-Server-Check";
 
         public const string RavenShardId = "Raven-Shard-Id";
-        
-        
+
+        public const string BuildVersion = "BuildVersion";
+
         public const string LastModified = "Last-Modified";
         public const string SerializedSizeOnDisk = "SerializedSizeOnDisk";
 
@@ -219,6 +223,9 @@ namespace Raven.Abstractions.Data
         public const string RavenReplicationIndexesTombstones = "Raven/Replication/Indexes/Tombstones";
         public const string RavenReplicationTransformerTombstones = "Raven/Replication/Transformers/Tombstones";
 
+        public const string RavenDeletedIndexesVersions = "Raven/Deleted/Indexes/Versions";
+        public const string RavenDeletedTransformersVersions = "Raven/Deleted/Transformers/Versions";
+
         public const string RavenSqlReplicationConnectionsDocumentName = "Raven/SqlReplication/Connections";
         public const string ReplicationPropagationDelayInSeconds = "Raven/Replication/ReplicationPropagationDelayInSeconds";
 
@@ -331,6 +338,8 @@ namespace Raven.Abstractions.Data
             public const string PreventSchemaUpdate = "Raven/PreventSchemaUpdate";
             public const string FsResourceMarker = ResourceMarkerPrefix + "file-system";
 
+            public const string DisableRDC = "Raven/FileSystem/DisableRDC";
+
             public static class Versioning
             {
                 public const string ChangesToRevisionsAllowed = "Raven/FileSystem/Versioning/ChangesToRevisionsAllowed";
@@ -409,6 +418,8 @@ namespace Raven.Abstractions.Data
             public const string InitialSize = "Raven/Voron/InitialSize";
 
             public const string MaxScratchBufferSize = "Raven/Voron/MaxScratchBufferSize";
+
+            public const string MaxSizePerScratchBufferFile = "Raven/Voron/MaxSizePerScratchBufferFile";
 
             public const string AllowOn32Bits = "Raven/Voron/AllowOn32Bits";
 

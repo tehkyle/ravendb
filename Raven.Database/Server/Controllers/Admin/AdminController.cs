@@ -24,7 +24,7 @@ using Raven.Database.Config;
 using System.Net.Http;
 using System.Security.Cryptography;
 using System.Text;
-
+using Rachis;
 using Raven.Abstractions.Smuggler;
 using Raven.Client.Document;
 using Raven.Database.DiskIO;
@@ -82,6 +82,14 @@ namespace Raven.Database.Server.Controllers.Admin
         [RavenRoute("admin/cluster-statistics")]
         public HttpResponseMessage GetClusterStatistics()
         {
+            var statistics = ClusterManager.Engine.EngineStatistics;
+            statistics.CurrenTopology = ClusterManager.Engine.PersistentStateCurrentTopology;
+            statistics.CommitIndex = ClusterManager.Engine.CommitIndex;
+            statistics.CurrentTerm = ClusterManager.Engine.PersistentState.CurrentTerm;
+            statistics.LastLogEntry = ClusterManager.Engine.PersistentState.LastLogEntry();
+            statistics.LastLogsEntries = ClusterManager.Engine.PersistentState.LastLogsEntries().ToList();
+            statistics.CurrentLeader = ClusterManager.Engine.CurrentLeader;
+            statistics.FollowersStatistics = ClusterManager.Engine.GetFollowerStatistics();
             return GetMessageWithObject(ClusterManager.Engine.EngineStatistics);
         }
 
@@ -361,7 +369,7 @@ namespace Raven.Database.Server.Controllers.Admin
                             restoreStatus.Messages.Add(msg);
                             DatabasesLandlord.SystemDatabase.Documents.Put(RestoreStatus.RavenRestoreStatusDocumentKey, null,
                                 RavenJObject.FromObject(restoreStatus), new RavenJObject(), null);
-                        });
+                        }, SystemConfiguration);
 
                     if (databaseDocument == null)
                         return;
@@ -1052,19 +1060,16 @@ namespace Raven.Database.Server.Controllers.Admin
 
                     ravenDebugDir = Path.Combine(Database.Configuration.TempPath, Path.GetRandomFileName());
                     var ravenDebugExe = Path.Combine(ravenDebugDir, "Raven.Debug.exe");
-                    var ravenDbgHelp = Path.Combine(ravenDebugDir, "dbghelp.dll");
                     var ravenDebugOutput = Path.Combine(ravenDebugDir, "stacktraces.txt");
 
                     Directory.CreateDirectory(ravenDebugDir);
 
                     if (Environment.Is64BitProcess)
                     {
-                        ExtractResource("Raven.Database.Util.Raven.Debug.x64.dbghelp.dll", ravenDbgHelp);
                         ExtractResource("Raven.Database.Util.Raven.Debug.x64.Raven.Debug.exe", ravenDebugExe);
                     }
                     else
                     {
-                        ExtractResource("Raven.Database.Util.Raven.Debug.x86.dbghelp.dll", ravenDbgHelp);
                         ExtractResource("Raven.Database.Util.Raven.Debug.x86.Raven.Debug.exe", ravenDebugExe);
                     }
 
@@ -1398,7 +1403,7 @@ namespace Raven.Database.Server.Controllers.Admin
                     mergedTopology.LocalDatabaseIds.Add(databaseId.Value);
 
                 databaseNames.Remove(db.Name);
-                var replicationSchemaDiscoverer = new ReplicationTopologyDiscoverer(db, new RavenJArray(), 10, Log);
+                var replicationSchemaDiscoverer = new ReplicationTopologyDiscoverer(db, Enumerable.Empty<string>(), 10, Log);
                 var node = replicationSchemaDiscoverer.Discover();
                 var topology = node.Flatten();
                 topology.Servers.ForEach(s => mergedTopology.Servers.Add(s));

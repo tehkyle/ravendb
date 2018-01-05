@@ -36,6 +36,8 @@ namespace Raven.Abstractions.Smuggler
 
         private const string IncrementalExportStateFile = "IncrementalExport.state.json";
 
+        private SmugglerDataFormat dataFormat = SmugglerDataFormat.V3;
+
         protected SmugglerDatabaseApiBase(SmugglerDatabaseOptions options)
         {
             Options = options;
@@ -967,7 +969,7 @@ namespace Raven.Abstractions.Smuggler
 
         public abstract Task Between(SmugglerBetweenOptions<RavenConnectionStringOptions> betweenOptions);
 
-        public async virtual Task ImportData(SmugglerImportOptions<RavenConnectionStringOptions> importOptions, Stream stream)
+        public virtual async Task ImportData(SmugglerImportOptions<RavenConnectionStringOptions> importOptions, Stream stream)
         {
             Operations.Configure(Options);
             Operations.Initialize(Options);
@@ -1013,7 +1015,25 @@ namespace Raven.Abstractions.Smuggler
             var exportSectionRegistar = new Dictionary<string, Func<Task<int>>>();
 
             Options.CancelToken.Token.ThrowIfCancellationRequested();
-            exportSectionRegistar.Add("BuildVersion", null);
+            exportSectionRegistar.Add(Constants.BuildVersion, () => // 4.0+
+            {
+                Operations.ShowProgress("Importing 4.0 smuggler file, skipping import of indexes and transformers");
+                Options.OperateOnTypes &= ~(ItemType.Indexes | ItemType.Transformers);
+                dataFormat = SmugglerDataFormat.V4;
+                return new CompletedTask<int>(0);
+            });
+
+            exportSectionRegistar.Add("RevisionDocuments", () => // 4.0+
+            {
+                Operations.ShowProgress("Importing 4.0 smuggler file, skipping import of document revisions");
+                while (jsonReader.Read() && jsonReader.TokenType != JsonToken.EndArray)
+                {
+                    var revision = (RavenJObject)RavenJToken.ReadFrom(jsonReader); // skipping
+                }
+
+                return new CompletedTask<int>(0);
+            });
+
             exportSectionRegistar.Add("Indexes", async () =>
             {
                 Operations.ShowProgress("Begin reading indexes");
@@ -1027,6 +1047,7 @@ namespace Raven.Abstractions.Smuggler
                 Operations.ShowProgress("Begin reading documents");
                 var documentCount = await ImportDocuments(jsonReader).ConfigureAwait(false);
                 Operations.ShowProgress(string.Format("Done with reading documents, total: {0}", documentCount));
+                
                 return documentCount;
             });
 
@@ -1103,7 +1124,7 @@ namespace Raven.Abstractions.Smuggler
                     continue;
                 }
 
-                if (jsonReader.TokenType != JsonToken.StartArray)
+                if (jsonReader.TokenType != JsonToken.StartArray && currentSection.Equals(Constants.BuildVersion) == false)
                 {
                     if (currentAction == null) // ignore this prop
                         continue;
@@ -1297,7 +1318,7 @@ namespace Raven.Abstractions.Smuggler
                 if ((Options.OperateOnTypes & ItemType.Transformers) != ItemType.Transformers)
                     continue;
 
-                var transformerName = transformer.Value<string>("name");
+                var transformerName = transformer.Value<string>("name") ?? transformer.Value<string>("Name");
 
                 try
                 {
@@ -1546,19 +1567,22 @@ namespace Raven.Abstractions.Smuggler
                     if (document == null)
                         continue;
 
-                    var metadata = document["@metadata"] as RavenJObject;
+                    var metadata = document[Constants.Metadata] as RavenJObject;
                     if (metadata != null)
                     {
                         if (Options.SkipConflicted && metadata.ContainsKey(Constants.RavenReplicationConflictDocument))
                             continue;
 
+                        if (dataFormat != SmugglerDataFormat.V3)
+                            document[Constants.Metadata] = SmugglerHelper.HandleMetadataChanges(metadata, dataFormat);
+
                         if (Options.StripReplicationInformation)
-                            document["@metadata"] = Operations.StripReplicationInformationFromMetadata(metadata);
+                            document[Constants.Metadata] = Operations.StripReplicationInformationFromMetadata(metadata);
 
                         if (Options.ShouldDisableVersioningBundle)
-                            document["@metadata"] = SmugglerHelper.DisableVersioning(metadata);
+                            document[Constants.Metadata] = SmugglerHelper.DisableVersioning(metadata);
 
-                        document["@metadata"] = SmugglerHelper.HandleConflictDocuments(metadata);
+                        document[Constants.Metadata] = SmugglerHelper.HandleConflictDocuments(metadata);
                     }
 
                     if (Options.UseContinuationFile)
@@ -1618,7 +1642,7 @@ namespace Raven.Abstractions.Smuggler
             await Operations.DeleteDocument(Constants.BulkImportHeartbeatDocKey).ConfigureAwait(false);
 
             await Operations.PutDocument(null, -1).ConfigureAwait(false); // force flush    
-
+            await Operations.WaitForLastBulkInsertTaskToFinish().ConfigureAwait(false);
             return count;
         }
 
@@ -1860,6 +1884,8 @@ namespace Raven.Abstractions.Smuggler
 
             public int NumberOfExportedItems { get; set; }
         }
+
+        
     }
 }
 

@@ -28,6 +28,7 @@ using Raven.Abstractions.MEF;
 using Raven.Abstractions.Util;
 using Raven.Abstractions.Util.Encryptors;
 using Raven.Abstractions.Util.MiniMetrics;
+using Raven.Bundles.Replication.Triggers;
 using Raven.Database.Actions;
 using Raven.Database.Commercial;
 using Raven.Database.Config;
@@ -45,8 +46,10 @@ using Raven.Database.Storage;
 using Raven.Database.Util;
 using Raven.Database.Plugins.Catalogs;
 using Raven.Database.Common;
+using Raven.Database.Json;
 using Raven.Database.Raft;
 using Raven.Database.Server.WebApi;
+using Voron;
 using ThreadState = System.Threading.ThreadState;
 
 namespace Raven.Database
@@ -61,7 +64,7 @@ namespace Raven.Database
 
         private readonly TaskScheduler backgroundTaskScheduler;
 
-        private readonly Raven.Abstractions.Threading.ThreadLocal<bool> disableAllTriggers = new Raven.Abstractions.Threading.ThreadLocal<bool>(() => false);
+        private readonly ThreadLocal<DisableTriggerState> disableAllTriggers = new ThreadLocal<DisableTriggerState>(() => new DisableTriggerState{Disabled = false});
 
         private readonly object idleLocker = new object();
 
@@ -89,7 +92,6 @@ namespace Raven.Database
 
         private readonly DocumentDatabaseInitializer initializer;
 
-        private readonly SizeLimitedConcurrentDictionary<string, TouchedDocumentInfo> recentTouches;
         public readonly FixedSizeConcurrentQueue<AutoTunerDecisionDescription> AutoTuningTrace = new FixedSizeConcurrentQueue<AutoTunerDecisionDescription>(100);
 
         public class IndexFailDetails
@@ -99,12 +101,9 @@ namespace Raven.Database
             public Exception Ex;
         }
 
-
         public RavenThreadPool ThreadPool { get; set; }
 
-
-
-        public DocumentDatabase(InMemoryRavenConfiguration configuration, DocumentDatabase systemDatabase, TransportState recievedTransportState = null)
+        public DocumentDatabase(InMemoryRavenConfiguration configuration, DocumentDatabase systemDatabase, TransportState recievedTransportState = null, Action<object, Exception> onError = null)
         {
             TimerManager = new ResourceTimerManager();
             DocumentLock = new PutSerialLock();
@@ -112,7 +111,7 @@ namespace Raven.Database
             Name = configuration.DatabaseName;
             ResourceName = Name;
             Configuration = configuration;
-
+            
             // initialize thread pool
             if (systemDatabase == null)
             {
@@ -127,12 +126,8 @@ namespace Raven.Database
                 ThreadPool = systemDatabase.ThreadPool;
             }
 
-
             transportState = recievedTransportState ?? new TransportState();
             ExtensionsState = new AtomicDictionary<object>();
-
-
-
 
             using (LogManager.OpenMappedContext("database", Name ?? Constants.SystemDatabase))
             {
@@ -153,8 +148,6 @@ namespace Raven.Database
 
                 backgroundTaskScheduler = configuration.CustomTaskScheduler ?? TaskScheduler.Default;
 
-                recentTouches = new SizeLimitedConcurrentDictionary<string, TouchedDocumentInfo>(configuration.MaxRecentTouchesToRemember, StringComparer.OrdinalIgnoreCase);
-
                 workContext = new WorkContext
                 {
                     Database = this,
@@ -169,7 +162,7 @@ namespace Raven.Database
                 try
                 {
                     uuidGenerator = new SequentialUuidGenerator();
-                    initializer.InitializeTransactionalStorage(uuidGenerator);
+                    initializer.InitializeTransactionalStorage(uuidGenerator, onError);
                     lastCollectionEtags = new LastCollectionEtags(WorkContext);
                 }
                 catch (Exception ex)
@@ -197,16 +190,16 @@ namespace Raven.Database
                 {
                     TransactionalStorage.Batch(actions => uuidGenerator.EtagBase = actions.General.GetNextIdentityValue("Raven/Etag"));
                     var reason = initializer.InitializeIndexDefinitionStorage();
-                    Indexes = new IndexActions(this, recentTouches, uuidGenerator, Log);
-                    Attachments = new AttachmentActions(this, recentTouches, uuidGenerator, Log);
-                    Maintenance = new MaintenanceActions(this, recentTouches, uuidGenerator, Log);
-                    Notifications = new NotificationActions(this, recentTouches, uuidGenerator, Log);
+                    Indexes = new IndexActions(this, uuidGenerator, Log);
+                    Attachments = new AttachmentActions(this, uuidGenerator, Log);
+                    Maintenance = new MaintenanceActions(this, uuidGenerator, Log);
+                    Notifications = new NotificationActions(this, uuidGenerator, Log);
                     Subscriptions = new SubscriptionActions(this, Log);
-                    Patches = new PatchActions(this, recentTouches, uuidGenerator, Log);
-                    Queries = new QueryActions(this, recentTouches, uuidGenerator, Log);
-                    Tasks = new TaskActions(this, recentTouches, uuidGenerator, Log);
-                    Transformers = new TransformerActions(this, recentTouches, uuidGenerator, Log);
-                    Documents = new DocumentActions(this, recentTouches, uuidGenerator, Log);
+                    Patches = new PatchActions(this, uuidGenerator, Log);
+                    Queries = new QueryActions(this, uuidGenerator, Log);
+                    Tasks = new TaskActions(this, uuidGenerator, Log);
+                    Transformers = new TransformerActions(this, uuidGenerator, Log);
+                    Documents = new DocumentActions(this, uuidGenerator, Log);
 
                     lastMapCompletedDatesPerCollection = new LastMapCompletedDatesPerCollection(this);
 
@@ -539,13 +532,16 @@ namespace Raven.Database
             if (unfilteredAggregate == null || unfilteredAggregate.Catalogs.Count == 0)
                 return new List<string>();
 
-            return types
-                .SelectMany(type => unfilteredAggregate.GetExports(new ImportDefinition(info => info.Metadata.ContainsKey("Bundle"), type.FullName, ImportCardinality.ZeroOrMore, false, false)))
-                .Select(info => info.Item2.Metadata["Bundle"] as string)
-                .Where(x => x != null)
+            var bundles = unfilteredAggregate.SelectMany(x => x.ExportDefinitions)
+                .Where(x => x.Metadata.ContainsKey("Bundle"))
+                .OrderBy(x => x.Metadata.ContainsKey("Order")
+                    ? (int)x.Metadata["Order"]
+                    : int.MaxValue)
+                .Select(x => x.Metadata["Bundle"] as string)
                 .Distinct()
-                .OrderBy(x => x)
                 .ToList();
+
+            return bundles;
         }
 
         public IndexingPerformanceStatistics[] IndexingPerformanceStatistics => (from pair in IndexDefinitionStorage.IndexDefinitions
@@ -889,13 +885,13 @@ namespace Raven.Database
         ///     need to be able to run without interference from any other bundle.
         /// </summary>
         /// <returns></returns>
-        public IDisposable DisableAllTriggersForCurrentThread()
+        public IDisposable DisableAllTriggersForCurrentThread(HashSet<Type> except = null)
         {
             if (disposed)
                 return new DisposableAction(() => { });
 
-            bool old = disableAllTriggers.Value;
-            disableAllTriggers.Value = true;
+            var old = disableAllTriggers.Value;
+            disableAllTriggers.Value = new DisableTriggerState{Disabled = true, Except = except };
             return new DisposableAction(() =>
             {
                 if (disposed)
@@ -948,6 +944,12 @@ namespace Raven.Database
 
             exceptionAggregator.Execute(() =>
             {
+                if (workContext != null)
+                    workContext.StopWorkRude();
+            });
+
+            exceptionAggregator.Execute(() =>
+            {
                 if (prefetcher != null)
                     prefetcher.Dispose();
             });
@@ -956,9 +958,6 @@ namespace Raven.Database
             {
                 initializer.UnsubscribeToDomainUnloadOrProcessExit();
                 disposed = true;
-
-                if (workContext != null)
-                    workContext.StopWorkRude();
             });
 
             if (initializer != null)
@@ -1014,6 +1013,18 @@ namespace Raven.Database
 
             if (TimerManager != null)
                 exceptionAggregator.Execute(TimerManager.Dispose);
+
+            if (AttachmentDeleteTriggers != null && AttachmentDeleteTriggers.Count > 0)
+                exceptionAggregator.Execute(() => AttachmentDeleteTriggers.Apply(x => x.Dispose()));
+
+            if (DeleteTriggers != null && DeleteTriggers.Count > 0)
+                exceptionAggregator.Execute(() => DeleteTriggers.Apply(x => x.Dispose()));
+
+            if (inFlightTransactionalState != null)
+                exceptionAggregator.Execute(inFlightTransactionalState.Dispose);
+
+            if (ConfigurationRetriever != null)
+                exceptionAggregator.Execute(ConfigurationRetriever.Dispose);
 
             try
             {
@@ -1207,6 +1218,10 @@ namespace Raven.Database
 
                     throw;
                 }
+                catch (OptimisticConcurrencyViolationException e)
+                {
+                    throw new ConcurrencyException(e.Message);
+                }
             }
         }
 
@@ -1236,10 +1251,38 @@ namespace Raven.Database
                     {
                         toDispose.Add(disposable);
                     }
-
-                    task.Value.Execute(this);
+                    try
+                    {
+                        task.Value.Execute(this);
+                    }
+                    //We catch any exception so not to cause the server to crash
+                    catch (Exception e)
+                    {
+                        LogErrorAndAddAlertOnStartupTaskException(task.GetType().FullName, e);
+                    }
                 }
             }
+        }
+
+        internal void LogErrorAndAddAlertOnStartupTaskException(string taskTypeName, Exception e)
+        {
+            var msg = $"An error was thrown from executing a startup task of type, {taskTypeName}, preventing its functionality from running.";
+            var exceptionMessage = $"Message:{e.Message}{Environment.NewLine}StackTrace:{e.StackTrace}";
+            var uniqueKey = $"{Name} startup task {taskTypeName} fatal error";
+            if (e.InnerException != null && !(e is AggregateException))
+            {
+                exceptionMessage += $"{Environment.NewLine}Inner exception Message:{e.InnerException.Message}{Environment.NewLine}StackTrace:{e.InnerException.StackTrace}";
+            }
+            else if (e is AggregateException)
+            {
+                var ae = e as AggregateException;
+                foreach (var a in ae.InnerExceptions)
+                {
+                    exceptionMessage += $"{Environment.NewLine}Aggregate exception Message:{a.Message}{Environment.NewLine}StackTrace:{a.StackTrace}";
+                }
+            }
+            Log.FatalException(msg, e);
+            this.AddAlert(new Alert { AlertLevel = AlertLevel.Error, CreatedAt = DateTime.UtcNow, Message = msg + Environment.NewLine, Exception = exceptionMessage, Title = "Fatal error in startup task", UniqueKey = uniqueKey });
         }
 
         private void InitializeIndexCodecTriggers()
@@ -1282,7 +1325,11 @@ namespace Raven.Database
         private BatchResult[] ProcessBatch(IList<ICommandData> commands, CancellationToken token)
         {
             var results = new BatchResult[commands.Count];
-            var participatingIds = commands.Select(x => x.Key).ToArray();
+            var participatingIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var command in commands)
+            {
+                participatingIds.Add(command.Key);
+            }
 
             for (int index = 0; index < commands.Count; index++)
             {
@@ -1434,7 +1481,7 @@ namespace Raven.Database
                 configuration.Container.SatisfyImportsOnce(database);
             }
 
-            public void InitializeTransactionalStorage(IUuidGenerator uuidGenerator)
+            public void InitializeTransactionalStorage(IUuidGenerator uuidGenerator, Action<object, Exception> onErrorAction = null)
             {
                 string storageEngineTypeName = configuration.SelectDatabaseStorageEngineAndFetchTypeName();
                 database.TransactionalStorage = configuration.CreateTransactionalStorage(storageEngineTypeName, database.WorkContext.HandleWorkNotifications, () =>
@@ -1453,7 +1500,7 @@ namespace Raven.Database
 
                     if (File.Exists(resourceTypeFile) == false)
                         using (File.Create(resourceTypeFile)) { }
-                });
+                },onErrorAction);
             }
 
             public Dictionary<int, IndexFailDetails> InitializeIndexDefinitionStorage()
@@ -1536,7 +1583,7 @@ namespace Raven.Database
 
             if (MappingTask != null)
                 return;
-            
+
             MappingTask = new Task(RunMapIndexes, TaskCreationOptions.LongRunning);
             MappingTask.Start();
         }
@@ -1579,7 +1626,7 @@ namespace Raven.Database
 
             if (ReducingTask != null)
                 return;
-            
+
             ReducingTask = new Task(RunReduceIndexes, TaskCreationOptions.LongRunning);
             ReducingTask.Start();
         }

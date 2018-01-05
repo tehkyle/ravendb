@@ -165,7 +165,7 @@ namespace Raven.Database.FileSystem.Storage.Voron
             };
         }
 
-        public void AssociatePage(string filename, int pageId, int pagePositionInFile, int pageSize)
+        public void AssociatePage(string filename, int pageId, int pagePositionInFile, int pageSize, bool incrementUsageCount = false)
         {
             var usageByFileName = storage.Usage.GetIndex(Tables.Usage.Indices.ByFileName);
             var usageByFileNameAndPosition = storage.Usage.GetIndex(Tables.Usage.Indices.ByFileNameAndPosition);
@@ -210,6 +210,23 @@ namespace Raven.Database.FileSystem.Storage.Voron
             storage.Usage.Add(writeBatch.Value, usageKeySlice, usage, 0);
             usageByFileName.MultiAdd(writeBatch.Value, (Slice)CreateKey(filename), usageKeySlice);
             usageByFileNameAndPosition.Add(writeBatch.Value, (Slice)CreateKey(filename, pagePositionInFile), usageKey, 0);
+
+            if (incrementUsageCount)
+                IncrementUsageCount(pageId);
+        }
+
+        private void IncrementUsageCount(int pageId)
+        {
+            var key = (Slice)CreateKey(pageId);
+
+            ushort version;
+            var page = LoadJson(storage.Pages, key, writeBatch.Value, out version);
+            if (page == null)
+                throw new InvalidOperationException($"Could not find page '{pageId}'. Probably data is corrupted.");
+
+            var usageCount = page.Value<int>("usage_count");
+            page["usage_count"] = usageCount + 1;
+            storage.Pages.Add(writeBatch.Value, key, page, version);
         }
 
         public int ReadPage(int pageId, byte[] buffer)
@@ -424,6 +441,36 @@ namespace Raven.Database.FileSystem.Storage.Voron
             };
         }
 
+        public FileUpdateResult TouchFile(string filename, Etag etag)
+        {
+            var key = CreateKey(filename);
+            var keySlice = (Slice)key;
+
+            ushort version;
+            var file = LoadJson(storage.Files, keySlice, writeBatch.Value, out version);
+            if (file == null)
+                throw new FileNotFoundException(filename);
+
+            var existingEtag = EnsureDocumentEtagMatch(filename, etag, file);
+
+            var newEtag = uuidGenerator.CreateSequentialUuid();
+
+            file["etag"] = newEtag.ToByteArray();
+
+            storage.Files.Add(writeBatch.Value, keySlice, file, version);
+
+            var filesByEtag = storage.Files.GetIndex(Tables.Files.Indices.ByEtag);
+
+            filesByEtag.Delete(writeBatch.Value, CreateKey(existingEtag));
+            filesByEtag.Add(writeBatch.Value, (Slice)CreateKey(newEtag), key);
+
+            return new FileUpdateResult()
+            {
+                PrevEtag = existingEtag,
+                Etag = newEtag
+            };
+        }
+
         public void CompleteFileUpload(string filename)
         {
             var key = (Slice)CreateKey(filename);
@@ -603,12 +650,14 @@ namespace Raven.Database.FileSystem.Storage.Voron
                     var newId = IdGenerator.GetNextIdForTable(storage.Usage);
                     var position = usage.Value<int>("file_pos");
 
+                    var pageId = usage.Value<int>("page_id");
+
                     var newUsage = new RavenJObject
                         {
                             { "id", newId },
                             { "name", targetFilename }, 
                             { "file_pos", position }, 
-                            { "page_id", usage.Value<int>("page_id") }, 
+                            { "page_id", pageId }, 
                             { "page_size", usage.Value<int>("page_size") }
                         };
 
@@ -618,6 +667,8 @@ namespace Raven.Database.FileSystem.Storage.Voron
 
                     usageByFileName.MultiAdd(writeBatch.Value, newKey, newUsageId);
                     usageByFileNameAndPosition.Add(writeBatch.Value, CreateKey(targetFilename, position), newUsageId);
+
+                    IncrementUsageCount(pageId);
 
                     if (commitPeriodically && count++ > 1000)
                     {

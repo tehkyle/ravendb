@@ -21,6 +21,9 @@ using Raven.Database.FileSystem.Synchronization.Rdc.Wrapper;
 using Raven.Database.FileSystem.Util;
 using Raven.Json.Linq;
 using FileSystemInfo = Raven.Abstractions.FileSystem.FileSystemInfo;
+using System.Diagnostics;
+using Raven.Client.Connection;
+using Raven.Client.Extensions;
 
 namespace Raven.Database.FileSystem.Synchronization
 {
@@ -29,6 +32,7 @@ namespace Raven.Database.FileSystem.Synchronization
         private static readonly ILog Log = LogManager.GetCurrentClassLogger();
 
         internal const int NumberOfFilesToCheckForSynchronization = 100;
+        private const int DefaultNumberOfCachedRequests = 2048;
 
         private readonly NotificationPublisher publisher;
         private readonly ITransactionalStorage storage;
@@ -36,7 +40,8 @@ namespace Raven.Database.FileSystem.Synchronization
         private readonly SynchronizationStrategy synchronizationStrategy;
         private readonly InMemoryRavenConfiguration systemConfiguration;
         private readonly SynchronizationTaskContext context;
-
+        private readonly ConcurrentDictionary<string, DestinationRequest> _requestFactories = new ConcurrentDictionary<string, DestinationRequest>();
+        
         private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, SynchronizationDetails>> activeIncomingSynchronizations =
             new ConcurrentDictionary<string, ConcurrentDictionary<string, SynchronizationDetails>>();
 
@@ -261,15 +266,38 @@ namespace Raven.Database.FileSystem.Synchronization
             return destinationSyncs;
         }
 
+        private DestinationRequest GetDestinationRequest(SynchronizationDestination destination)
+        {
+            return _requestFactories.GetOrAdd(destination.Url, url =>
+            {
+                var conventions = new FilesConvention();
+                string authenticationScheme = null;
+
+                if (string.IsNullOrEmpty(destination.AuthenticationScheme) == false)
+                {
+                    authenticationScheme = destination.AuthenticationScheme;
+                    conventions.AuthenticationScheme = destination.AuthenticationScheme;
+                }
+
+                var factory = new HttpJsonRequestFactory(DefaultNumberOfCachedRequests, authenticationScheme: authenticationScheme);
+
+                SecurityExtensions.InitializeSecurity(conventions, factory, destination.ServerUrl, autoRefreshToken: false);
+
+                return new DestinationRequest(factory, conventions);
+            });
+        }
+
         public async Task<SynchronizationReport> SynchronizeFileToAsync(string fileName, SynchronizationDestination destination)
         {
             ICredentials credentials = destination.Credentials;
+            
+            var factory = GetDestinationRequest(destination);
 
-            var conventions = new FilesConvention();
             if (string.IsNullOrEmpty(destination.AuthenticationScheme) == false)
-                conventions.AuthenticationScheme = destination.AuthenticationScheme;
+                factory.Conventions.AuthenticationScheme = destination.AuthenticationScheme;
 
-            var destinationClient = new SynchronizationServerClient(destination.ServerUrl, destination.FileSystem, convention: conventions, apiKey: destination.ApiKey, credentials: credentials);
+            var destinationClient = new SynchronizationServerClient(destination.ServerUrl, destination.FileSystem, convention: factory.Conventions,
+                apiKey: destination.ApiKey, credentials: credentials, requestFactory: factory.RequestFactory);
 
             RavenJObject destinationMetadata;
 
@@ -311,53 +339,77 @@ namespace Raven.Database.FileSystem.Synchronization
         {
             ICredentials credentials = destination.Credentials;
 
-            var destinationSyncClient = new SynchronizationServerClient(destination.ServerUrl, destination.FileSystem, destination.ApiKey, credentials);
+            var request = GetDestinationRequest(destination);
+
+            var destinationSyncClient = new SynchronizationServerClient(destination.ServerUrl, destination.FileSystem, destination.ApiKey,
+                credentials, request.RequestFactory, request.Conventions);
 
             bool repeat;
 
             do
             {
-                var lastETag = await destinationSyncClient.GetLastSynchronizationFromAsync(storage.Id).ConfigureAwait(false);
-
-                var activeTasks = synchronizationQueue.Active;
-                var filesNeedConfirmation = GetSyncingConfigurations(destination).Where(sync => activeTasks.All(x => x.FileName != sync.FileName)).ToList();
-
-                var confirmations = await ConfirmPushedFiles(filesNeedConfirmation, destinationSyncClient).ConfigureAwait(false);
-
-                var needSyncingAgain = new List<FileHeader>();
-
-                foreach (var confirmation in confirmations)
-                {
-                    if (confirmation.Status == FileStatus.Safe)
-                    {
-                        if (Log.IsDebugEnabled)
-                            Log.Debug("Destination server {0} said that file '{1}' is safe", destination, confirmation.FileName);
-
-                        RemoveSyncingConfiguration(confirmation.FileName, destination.Url);
-                    }
-                    else
-                    {
-                        storage.Batch(accessor =>
-                        {
-                            var fileHeader = accessor.ReadFile(confirmation.FileName);
-
-                            if (fileHeader != null)
-                            {
-                                needSyncingAgain.Add(fileHeader);
-
-                                if (Log.IsDebugEnabled)
-                                    Log.Debug("Destination server {0} said that file '{1}' is {2}.", destination, confirmation.FileName, confirmation.Status);
-                            }
-                        });
-                    }
-                }
-
                 if (synchronizationQueue.NumberOfPendingSynchronizationsFor(destination.Url) < AvailableSynchronizationRequestsTo(destination.Url))
                 {
+                    var activeTasks = synchronizationQueue.Active;
+                    var filesNeedConfirmation = GetSyncingConfigurations(destination).Where(sync => activeTasks.All(x => x.FileName != sync.FileName)).ToList();
+
+                    var confirmations = await ConfirmPushedFiles(filesNeedConfirmation, destinationSyncClient).ConfigureAwait(false);
+
+                    var needSyncingAgain = new List<FileHeader>();
+
+                    Debug.Assert(filesNeedConfirmation.Count == confirmations.Length);
+
+                    for (int i = 0; i < confirmations.Length; i++)
+                    {
+                        var confirmation = confirmations[i];
+
+                        if (confirmation.Status == FileStatus.Safe)
+                        {
+                            if (Log.IsDebugEnabled)
+                                Log.Debug("Destination server {0} said that file '{1}' is safe", destination, confirmation.FileName);
+
+                            RemoveSyncingConfiguration(confirmation.FileName, destination.Url);
+                        }
+                        else
+                        {
+                            storage.Batch(accessor =>
+                            {
+                                var fileHeader = accessor.ReadFile(confirmation.FileName);
+
+                                if (fileHeader == null)
+                                {
+                                    if (Log.IsDebugEnabled)
+                                        Log.Debug("Destination server {0} said that file '{1}' is {2} but such file no longer exists. Removing related syncing configuration", destination, confirmation.FileName, confirmation.Status);
+
+                                    RemoveSyncingConfiguration(confirmation.FileName, destination.Url);
+                                }
+                                else if (EtagUtil.IsGreaterThan(fileHeader.Etag, filesNeedConfirmation[i].FileETag))
+                                {
+                                    if (Log.IsDebugEnabled)
+                                        Log.Debug("Destination server {0} said that file '{1}' is {2} but such file has been changed since we stored the syncing configuration. " +
+                                                  "Stored etag in configuration is {3} while current file etag is {4}. Removing related syncing configuration", destination, confirmation.FileName, confirmation.Status, fileHeader.Etag, filesNeedConfirmation[i].FileETag);
+
+                                    RemoveSyncingConfiguration(confirmation.FileName, destination.Url);
+                                }
+                                else
+                                {
+                                    needSyncingAgain.Add(fileHeader);
+
+                                    if (Log.IsDebugEnabled)
+                                        Log.Debug("Destination server {0} said that file '{1}' is {2}.", destination, confirmation.FileName, confirmation.Status);
+                                }
+                            });
+                        }
+                    }
+
+                    var lastETag = await destinationSyncClient.GetLastSynchronizationFromAsync(storage.Id).ConfigureAwait(false);
+
                     repeat = await EnqueueMissingUpdatesAsync(destinationSyncClient, lastETag, needSyncingAgain).ConfigureAwait(false) == false;
                 }
                 else
-                    repeat = false;
+                {
+                    break;
+                }
             }
             while (repeat);
 
@@ -482,7 +534,8 @@ namespace Raven.Database.FileSystem.Synchronization
                     });
                 }
 
-                enqueued = true;
+                if (needSyncingAgain.Contains(fileHeader) == false)
+                    enqueued = true;
             }
 
             if (enqueued == false && EtagUtil.IsGreaterThan(maxEtagOfFilteredDoc, synchronizationInfo.LastSourceFileEtag))
@@ -637,11 +690,11 @@ namespace Raven.Database.FileSystem.Synchronization
                 }
             }
 
-            Queue.SynchronizationFinished(work, destinationUrl);
-
             if (synchronizationCancelled == false)
                 CreateSyncingConfiguration(fileName, work.FileETag, destinationUrl, work.SynchronizationType);
 
+            Queue.SynchronizationFinished(work, destinationUrl);
+            
             publisher.Publish(new SynchronizationUpdateNotification
             {
                 FileName = work.FileName,
@@ -844,8 +897,36 @@ namespace Raven.Database.FileSystem.Synchronization
                     Log.Warn("Synchronization task stopped with the following exception", aggregate.InnerException);
                 }
             }
+            finally
+            {
+                foreach (var factory in _requestFactories)
+                {
+                    try
+                    {
+                        factory.Value.RequestFactory.Dispose();
+                    }
+                    catch (Exception e)
+                    {
+                        if (Log.IsDebugEnabled)
+                            Log.Debug("Synchronization task disposal thew an exception on request factory dispose. Exception: " + e);
+                    }
+                }
+            }
 
             context.Dispose();
+        }
+
+        public class DestinationRequest
+        {
+            public readonly HttpJsonRequestFactory RequestFactory;
+
+            public readonly FilesConvention Conventions;
+
+            public DestinationRequest(HttpJsonRequestFactory factory, FilesConvention conventions)
+            {
+                RequestFactory = factory;
+                Conventions = conventions;
+            }
         }
     }
 }

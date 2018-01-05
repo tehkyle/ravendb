@@ -25,6 +25,7 @@ using Raven.Abstractions.Extensions;
 using Raven.Abstractions.Json;
 using Raven.Abstractions.Replication;
 using Raven.Abstractions.Smuggler;
+using Raven.Abstractions.Smuggler.Data;
 using Raven.Abstractions.Util;
 using Raven.Bundles.Versioning.Triggers;
 using Raven.Client.Util;
@@ -115,15 +116,26 @@ for(var customFunction in customFunctions) {{
         [HttpGet]
         [RavenRoute("studio-tasks/check-sufficient-diskspace")]
         [RavenRoute("databases/{databaseName}/studio-tasks/check-sufficient-diskspace")]
-        public async Task<HttpResponseMessage> CheckSufficientDiskspaceBeforeImport(long fileSize)
+        public HttpResponseMessage CheckSufficientDiskspaceBeforeImport(long fileSize)
         {
             var tempRoot = Path.GetPathRoot(Database.Configuration.TempPath);
             var rootPathToDriveInfo = new Dictionary<string, DriveInfo>();
             DriveInfo.GetDrives().ForEach(drive => rootPathToDriveInfo[drive.RootDirectory.FullName] = drive);
+
             DriveInfo tempFolderDrive;
-            if (!rootPathToDriveInfo.TryGetValue(tempRoot, out tempFolderDrive) ||
-                tempFolderDrive.AvailableFreeSpace - (long)(tempFolderDrive.TotalSize * 0.1) < fileSize)
-                throw new HttpResponseException(HttpStatusCode.BadRequest);
+            if (rootPathToDriveInfo.TryGetValue(tempRoot, out tempFolderDrive) == false)
+                return GetMessageWithObject(new
+                {
+                    Error = $"Couldn't find the location of the temp drive: {tempRoot}"
+                }, HttpStatusCode.BadRequest);
+
+            var minFreeSpace = Math.Min(fileSize * 3, fileSize + (long)3 * 1024 * 1024 * 1024);
+            if (tempFolderDrive.AvailableFreeSpace < minFreeSpace)
+                return GetMessageWithObject(new
+                {
+                    Error = $"The availiable space is {tempFolderDrive.AvailableFreeSpace * 1.0 / 1024 / 1024 / 1024:0.##}GB " +
+                            $"while we need at least {minFreeSpace / 1024 / 1024 / 1024:0.##}GB"
+                }, HttpStatusCode.BadRequest);
 
             return GetEmptyMessage();
         }
@@ -239,7 +251,7 @@ for(var customFunction in customFunctions) {{
             Database.Tasks.AddTask(task, status, new TaskActions.PendingTaskDescription
             {
                 StartTime = SystemTime.UtcNow,
-                TaskType = TaskActions.PendingTaskType.ExportDatabase,
+                TaskType = TaskActions.PendingTaskType.ImportDatabase,
                 Description = fileName
             }, out id, cts);
 
@@ -288,7 +300,7 @@ for(var customFunction in customFunctions) {{
 
                     var dataDumper = new DatabaseDataDumper(Database, smugglerOptions);
                     dataDumper.Progress += s => status.MarkProgress(s);
-                    await dataDumper.ExportData(
+                    var operationState = await dataDumper.ExportData(
                         new SmugglerExportOptions<RavenConnectionStringOptions>
                         {
                             ToStream = outputStream
@@ -296,6 +308,7 @@ for(var customFunction in customFunctions) {{
 
                     const string message = "Completed export";
                     status.MarkCompleted(message, sp.Elapsed);
+                    status.OperationState = operationState;
                 }
                 catch (OperationCanceledException e)
                 {
@@ -925,6 +938,8 @@ for(var customFunction in customFunctions) {{
         private class DataDumperOperationStatus : OperationStateBase
         {
             public string ExceptionDetails { get; set; }
+
+            public OperationState OperationState { get; set; }
         }
 
         private class CollectionNameAndCount

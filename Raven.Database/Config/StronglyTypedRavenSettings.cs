@@ -123,6 +123,8 @@ namespace Raven.Database.Config
                 new TimeSpanSetting(settings["Raven/MemoryCacheLimitCheckInterval"], MemoryCache.Default.PollingInterval,
                                     TimeSpanArgumentType.FromParse);
 
+            MemoryCacher = new StringSetting(settings["Raven/MemoryCacher"], (string)null);
+
             PrewarmFacetsSyncronousWaitTime =
                 new TimeSpanSetting(settings["Raven/PrewarmFacetsSyncronousWaitTime"], TimeSpan.FromSeconds(3),
                                     TimeSpanArgumentType.FromParse);
@@ -211,8 +213,6 @@ namespace Raven.Database.Config
                 new StringSetting(settings["Raven/CompiledIndexCacheDirectory"], @"~\CompiledIndexCache");
             TaskScheduler =
                 new StringSetting(settings["Raven/TaskScheduler"], (string)null);
-            AllowLocalAccessWithoutAuthorization =
-                new BooleanSetting(settings["Raven/AllowLocalAccessWithoutAuthorization"], false);
             RejectClientsModeEnabled =
                 new BooleanSetting(settings[Constants.RejectClientsModeEnabled], false);
 
@@ -244,14 +244,13 @@ namespace Raven.Database.Config
             MaxStepsForScript = new IntegerSetting(settings["Raven/MaxStepsForScript"], 10 * 1000);
             AdditionalStepsForScriptBasedOnDocumentSize = new IntegerSetting(settings["Raven/AdditionalStepsForScriptBasedOnDocumentSize"], 5);
 
-            MaxRecentTouchesToRemember = new IntegerSetting(settings["Raven/MaxRecentTouchesToRemember"], 1024);
-
             Prefetcher.FetchingDocumentsFromDiskTimeoutInSeconds = new IntegerSetting(settings["Raven/Prefetcher/FetchingDocumentsFromDiskTimeout"], 5);
             Prefetcher.MaximumSizeAllowedToFetchFromStorageInMb = new IntegerSetting(settings["Raven/Prefetcher/MaximumSizeAllowedToFetchFromStorage"], 256);
 
             Voron.MaxBufferPoolSize = new IntegerSetting(settings[Constants.Voron.MaxBufferPoolSize], 4);
             Voron.InitialFileSize = new NullableIntegerSetting(settings[Constants.Voron.InitialFileSize], (int?)null);
             Voron.MaxScratchBufferSize = new IntegerSetting(settings[Constants.Voron.MaxScratchBufferSize], 6144);
+            Voron.MaxSizePerScratchBufferFile = new IntegerSetting(settings[Constants.Voron.MaxSizePerScratchBufferFile], 256);
 
             var maxScratchBufferSize = Voron.MaxScratchBufferSize.Value;
             var scratchBufferSizeNotificationThreshold = -1;
@@ -295,6 +294,7 @@ namespace Raven.Database.Config
             FileSystem.DataDir = new StringSetting(settings[Constants.FileSystem.DataDirectory], @"~\FileSystems");
             FileSystem.DefaultStorageTypeName = new StringSetting(settings[Constants.FileSystem.Storage], string.Empty);
             FileSystem.PreventSchemaUpdate = new BooleanSetting(settings[Constants.FileSystem.PreventSchemaUpdate], false);
+            FileSystem.DisableRDC = new BooleanSetting(settings[Constants.FileSystem.DisableRDC], false);
 
             Studio.AllowNonAdminUsersToSetupPeriodicExport = new BooleanSetting(settings[Constants.AllowNonAdminUsersToSetupPeriodicExport], false);
 
@@ -423,6 +423,8 @@ namespace Raven.Database.Config
 
         public TimeSpanSetting MemoryCacheLimitCheckInterval { get; private set; }
 
+        public StringSetting MemoryCacher { get; private set; }
+
         public TimeSpanSetting MaxProcessingRunLatency { get; private set; }
 
         public TimeSpanSetting PrewarmFacetsOnIndexingMaxAge { get; private set; }
@@ -496,9 +498,6 @@ namespace Raven.Database.Config
 
         public StringSetting TaskScheduler { get; private set; }
 
-        public BooleanSetting AllowLocalAccessWithoutAuthorization { get; private set; }
-
-
         public BooleanSetting RejectClientsModeEnabled { get; private set; }
 
         public TimeSpanSetting MaxIndexCommitPointStoreTimeInterval { get; private set; }
@@ -526,8 +525,6 @@ namespace Raven.Database.Config
 
         public TimeSpanSetting DatbaseOperationTimeout { get; private set; }
 
-        public IntegerSetting MaxRecentTouchesToRemember { get; private set; }
-
         public StringSetting DefaultStorageTypeName { get; private set; }
 
         public IntegerSetting FlushIndexToDiskSizeInMb { get; set; }
@@ -545,6 +542,8 @@ namespace Raven.Database.Config
             public NullableIntegerSetting InitialFileSize { get; set; }
 
             public IntegerSetting MaxScratchBufferSize { get; set; }
+
+            public IntegerSetting MaxSizePerScratchBufferFile { get; set; }
 
             public IntegerSetting ScratchBufferSizeNotificationThreshold { get; set; }
 
@@ -643,6 +642,8 @@ namespace Raven.Database.Config
             public StringSetting DefaultStorageTypeName { get; set; }
 
             public BooleanSetting PreventSchemaUpdate { get; set; }
+
+            public BooleanSetting DisableRDC { get; set; }
         }
 
         public class CounterConfiguration

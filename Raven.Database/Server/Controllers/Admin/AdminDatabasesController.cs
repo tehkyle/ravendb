@@ -70,7 +70,21 @@ namespace Raven.Database.Server.Controllers.Admin
                 return GetMessageWithString(error, HttpStatusCode.BadRequest);
             }
             var dbDoc = await ReadJsonObjectAsync<DatabaseDocument>().ConfigureAwait(false);
-            
+
+            //Preventing the modification of the database document when it is not actually changed
+            //And it happens, see http://issues.hibernatingrhinos.com/issue/RavenDB-7820
+            var docKey = Constants.Database.Prefix + id;
+            var databaseDocument = SystemDatabase.Documents.Get(docKey, null);
+            var existingDbDoc = databaseDocument?.DataAsJson.JsonDeserialization<DatabaseDocument>();
+            if (existingDbDoc != null)
+            {                
+                DatabasesLandlord.Unprotect(existingDbDoc);
+                if (DatabaseDocument.CompareDatabaseDocumentWithoutId(existingDbDoc, dbDoc))
+                {
+                    return GetEmptyMessage(HttpStatusCode.NotModified);
+                }                
+            }
+
             string bundles;			
             if (dbDoc.Settings.TryGetValue(Constants.ActiveBundles, out bundles) && bundles.Contains("Encryption"))
             {
@@ -133,17 +147,23 @@ namespace Raven.Database.Server.Controllers.Admin
             var json = RavenJObject.FromObject(dbDoc);
             json.Remove("Id");
 
-            var metadata = (etag != null) ? ReadInnerHeaders.FilterHeadersToObject() : new RavenJObject();
-            var docKey = Constants.Database.Prefix + id;
+            var metadata = (etag != null) ? ReadInnerHeaders.FilterHeadersToObject() : new RavenJObject();            
             var putResult = Database.Documents.Put(docKey, etag, json, metadata, null);
 
             return (etag == null) ? GetEmptyMessage() : GetMessageWithObject(putResult);
         }
 
+        private const string BatchDeleteUrl = "batch-delete";
+
         [HttpDelete]
         [RavenRoute("admin/databases/{*id}")]
         public async Task<HttpResponseMessage> Delete(string id)
         {
+            if (id == BatchDeleteUrl)
+            {
+                return await BatchDelete().ConfigureAwait(false);
+            }
+
             bool result;
             var hardDelete = bool.TryParse(GetQueryStringValue("hard-delete"), out result) && result;
 
@@ -157,7 +177,7 @@ namespace Raven.Database.Server.Controllers.Admin
         }
 
         [HttpDelete]
-        [RavenRoute("admin/databases/batch-delete")]
+        [RavenRoute("admin/databases-batch-delete")]
         public async Task<HttpResponseMessage> BatchDelete()
         {
             string[] databasesToDelete = GetQueryStringValues("ids");
@@ -282,7 +302,7 @@ namespace Raven.Database.Server.Controllers.Admin
 
         [HttpGet]
         [RavenRoute("admin/test-hotspare")]
-        public HttpResponseMessage TestHotSpare()
+        public async Task<HttpResponseMessage> TestHotSpare()
         {
             //making sure this endpoint is not invoked on non hot spare license.
             var status = ValidateLicense.CurrentLicense;
@@ -295,9 +315,10 @@ namespace Raven.Database.Server.Controllers.Admin
                 };
             }
 
-            RequestManager.HotSpareValidator.EnableTestModeForHotSpareLicense();
+            await RequestManager.HotSpareValidator.EnableTestModeForHotSpareLicense().ConfigureAwait(false);
             return GetEmptyMessage();
         }
+
         [HttpGet]
         [RavenRoute("admin/get-hotspare-information")]
         public HttpResponseMessage GetHotSpareInformation()
@@ -312,10 +333,10 @@ namespace Raven.Database.Server.Controllers.Admin
                     Content = new MultiGetSafeStringContent("Can't test Hot Spare server, no valid license found")
                 };
             }
+
             var info = RequestManager.HotSpareValidator.GetOrCreateLicenseDocument(id, checkIfTesting: true);
             return GetMessageWithObject(info);
         }
-
 
         [HttpGet]
         [RavenRoute("admin/clear-hotspare-information")]

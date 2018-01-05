@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.IO.Compression;
@@ -6,11 +7,15 @@ using System.Linq;
 using System.Threading;
 using Raven.Abstractions.Data;
 using Raven.Abstractions.Extensions;
+using Raven.Abstractions.FileSystem;
 using Raven.Abstractions.MEF;
 using Raven.Bundles.Compression.Plugin;
 using Raven.Bundles.Encryption.Plugin;
 using Raven.Bundles.Encryption.Settings;
 using Raven.Database.Config;
+using Raven.Database.FileSystem;
+using Raven.Database.FileSystem.Infrastructure;
+using Raven.Database.FileSystem.Util;
 using Raven.Database.Impl;
 using Raven.Database.Plugins;
 using Raven.Database.Storage;
@@ -20,10 +25,10 @@ using Raven.Database.Util;
 
 namespace Raven.StorageExporter
 {
-    public class StorageExporter
+    public class StorageExporter : IDisposable
     {
         public StorageExporter(string databaseBaseDirectory, string databaseOutputFile, 
-            int batchSize, Etag documentsStartEtag, bool hasCompression, EncryptionConfiguration encryption)
+            int batchSize, Etag documentsStartEtag, bool hasCompression, EncryptionConfiguration encryption, string journalsPath, bool isRavenFs)
         {
             HasCompression = hasCompression;
             Encryption = encryption;
@@ -36,10 +41,22 @@ namespace Raven.StorageExporter
                 Storage =
                 {
                     PreventSchemaUpdate = true,
-                    SkipConsistencyCheck = true
+                    SkipConsistencyCheck = true,
+                    Voron =
+                    {
+                        JournalsStoragePath = journalsPath
+                    },
+                    Esent =
+                    {
+                        JournalsStoragePath = journalsPath
+                    }
                 }
             };
-            CreateTransactionalStorage(ravenConfiguration);
+            if (isRavenFs)
+            {
+                ravenConfiguration.FileSystem.DataDirectory = databaseBaseDirectory;
+            }
+            CreateTransactionalStorage(ravenConfiguration, isRavenFs);
             this.batchSize = batchSize;
             DocumentsStartEtag = documentsStartEtag;
         }
@@ -49,6 +66,27 @@ namespace Raven.StorageExporter
         public bool HasCompression { get; set; }
 
         public EncryptionConfiguration Encryption { get; set; }
+
+        public void ExportFilesystemAsAttachments()
+        {
+            using (var stream = File.Create(outputDirectory))
+            using (var gZipStream = new GZipStream(stream, CompressionMode.Compress, leaveOpen: true))
+            using (var streamWriter = new StreamWriter(gZipStream))
+            {
+                var jsonWriter = new JsonTextWriter(streamWriter)
+                {
+                    Formatting = Formatting.Indented
+                };
+                jsonWriter.WriteStartObject();
+                //Attachments
+                jsonWriter.WritePropertyName("Attachments");
+                jsonWriter.WriteStartArray();
+                WriteFilesAsAttachments(jsonWriter);
+                jsonWriter.WriteEndArray();
+                jsonWriter.WriteEndObject();
+                streamWriter.Flush();
+            }
+        }
 
         public void ExportDatabase()
         {
@@ -280,6 +318,120 @@ namespace Raven.StorageExporter
             } while (totalIdentities > currentIdentitiesCount);
         }
 
+        private List<string> _filteredFilesystemProperties = new List<string>
+            {
+                "Raven-Synchronization-History" , "Raven-Synchronization-Version", "Raven-Synchronization-Source", "ETag", "Raven-Creation-Date" , "Raven-Last-Modified" , "Origin" , "Content-MD5", "RavenFS-Size"
+            };
+
+        private void WriteFilesAsAttachments(JsonTextWriter jsonWriter)
+        {
+            int totalFilesCount = 0;
+            fileStorage.Batch(accsesor =>
+            {
+                totalFilesCount = accsesor.GetFileCount();
+            });
+            if(totalFilesCount == 0)
+                return;
+            int currentFilesCount = 0;
+            int previousFilesCount = 0;
+            var lastEtag = Etag.Empty;
+            
+            do
+            {                
+                try
+                {
+                    previousFilesCount = currentFilesCount;
+                    var hadFiles = false;
+
+                    fileStorage.Batch(accsesor =>
+                    {
+                        var fileHeaders = accsesor.GetFilesAfter(lastEtag, batchSize);
+
+                        foreach (var header in fileHeaders)
+                        {      
+                            hadFiles = true;
+
+                            if(ShouldSkipFile(header))
+                                continue;
+                            var file = StorageStream.Reading(fileStorage, header.FullPath);
+                            jsonWriter.WriteStartObject();
+                            jsonWriter.WritePropertyName("Data");
+                            WriteFileAsBase64(jsonWriter, file);
+                            jsonWriter.WritePropertyName("Metadata");
+                            var fileEtag = header.Etag;
+                            var metadata = FilterMetadataProperties(header.Metadata);
+                            metadata.WriteTo(jsonWriter);
+                            jsonWriter.WritePropertyName("Key");
+                            var key = RemoveSlashIfNeeded(header.FullPath);
+                            jsonWriter.WriteValue(key);
+                            jsonWriter.WritePropertyName("Etag");
+                            jsonWriter.WriteNull();
+                            jsonWriter.WriteEndObject();
+                            lastEtag = fileEtag;
+                            currentFilesCount++;
+                            if (currentFilesCount % batchSize == 0)
+                                ReportProgress("files", currentFilesCount, totalFilesCount);
+                        }
+                    });
+
+                    if (hadFiles == false)
+                        break;
+                }
+                catch (Exception e)
+                {
+                    lastEtag = lastEtag.IncrementBy(1);
+                    currentFilesCount++;
+                    ReportCorrupted("files", currentFilesCount, e.Message);
+                }
+                finally
+                {
+                    if (currentFilesCount > previousFilesCount)
+                        ReportProgress("files", currentFilesCount, totalFilesCount);
+                }
+            } while (currentFilesCount < totalFilesCount);
+        }
+
+        private bool ShouldSkipFile(FileHeader header)
+        {
+            return header.Name.EndsWith(".deleting") || header.Name.EndsWith(".downloading") || header.IsTombstone;
+        }
+
+        private MemoryStream _buffer = new MemoryStream();
+        private void WriteFileAsBase64(JsonTextWriter jsonWriter, StorageStream file)
+        {
+            _buffer.SetLength(0);
+            file.CopyTo(_buffer);
+
+            var base64String = Convert.ToBase64String(_buffer.GetBuffer(), 0, (int)_buffer.Length, Base64FormattingOptions.None);
+            jsonWriter.WriteValue(base64String);
+        }
+
+        private string RemoveSlashIfNeeded(string headerFullPath)
+        {
+            if (headerFullPath.StartsWith("/"))
+                return headerFullPath.Substring(1);
+            return headerFullPath;
+        }
+
+        private RavenJObject FilterMetadataProperties(RavenJObject headerMetadata, bool rec = false)
+        {
+            try
+            {
+                foreach (var p in _filteredFilesystemProperties)
+                {
+                    headerMetadata.Remove(p);
+                }
+            }
+            //If we are working on a snapshot we can't modify it, not sure it can happen but better safe than sorry
+            catch (InvalidOperationException)
+            {
+                if (rec)
+                    throw;
+                return FilterMetadataProperties(headerMetadata.CloneToken() as RavenJObject, true);
+            }
+            return headerMetadata;
+        }
+
         private void WriteAttachments(JsonTextWriter jsonWriter)
         {
             long totalAttachmentsCount = 0;
@@ -366,13 +518,13 @@ namespace Raven.StorageExporter
             return false;
         }
 
-        private void CreateTransactionalStorage(InMemoryRavenConfiguration ravenConfiguration)
+        private void CreateTransactionalStorage(InMemoryRavenConfiguration ravenConfiguration, bool isRavenFs)
         {
             if (string.IsNullOrEmpty(ravenConfiguration.DataDirectory) == false && Directory.Exists(ravenConfiguration.DataDirectory))
             {
                 try
                 {
-                    if (TryToCreateTransactionalStorage(ravenConfiguration, HasCompression, Encryption, out storage) == false)
+                    if (TryToCreateTransactionalStorage(ravenConfiguration, HasCompression, Encryption, isRavenFs, out storage, out fileStorage) == false)
                         ConsoleUtils.PrintErrorAndFail("Failed to create transactional storage");
                 }
                 catch (UnauthorizedAccessException uae)
@@ -396,17 +548,42 @@ namespace Raven.StorageExporter
         }
 
         public static bool TryToCreateTransactionalStorage(InMemoryRavenConfiguration ravenConfiguration,
-            bool hasCompression, EncryptionConfiguration encryption, out ITransactionalStorage storage)
+            bool hasCompression, EncryptionConfiguration encryption, bool isRavenFs, 
+            out ITransactionalStorage storage, out Database.FileSystem.Storage.ITransactionalStorage fileStorage)
         {
             storage = null;
+            fileStorage = null;
             if (File.Exists(Path.Combine(ravenConfiguration.DataDirectory, Voron.Impl.Constants.DatabaseFilename)))
-                storage = ravenConfiguration.CreateTransactionalStorage(InMemoryRavenConfiguration.VoronTypeName, () => { }, () => { });
-            else if (File.Exists(Path.Combine(ravenConfiguration.DataDirectory, "Data")))
-                storage = ravenConfiguration.CreateTransactionalStorage(InMemoryRavenConfiguration.EsentTypeName, () => { }, () => { });
-
-            if (storage == null)
+            {
+                if (isRavenFs)
+                {
+                    fileStorage = RavenFileSystem.CreateTransactionalStorage(ravenConfiguration);
+                }
+                else
+                {
+                    storage = ravenConfiguration.CreateTransactionalStorage(InMemoryRavenConfiguration.VoronTypeName, () => { }, () => { });
+                }
+            }
+            else if (File.Exists(Path.Combine(ravenConfiguration.DataDirectory, "Data.ravenfs"))||
+                     File.Exists(Path.Combine(ravenConfiguration.DataDirectory, "Data")))
+            {
+                if (isRavenFs)
+                {
+                    fileStorage = RavenFileSystem.CreateTransactionalStorage(ravenConfiguration);
+                }
+                else
+                {
+                    storage = ravenConfiguration.CreateTransactionalStorage(InMemoryRavenConfiguration.EsentTypeName, () => { }, () => { });
+                }
+            }
+            if (storage == null && fileStorage == null)
                 return false;
-
+            if (isRavenFs)
+            {
+                var filesOrderedPartCollection = new OrderedPartCollection<Database.FileSystem.Plugins.AbstractFileCodec>();
+                fileStorage.Initialize(new UuidGenerator(), filesOrderedPartCollection);
+                return true;
+            }
             var orderedPartCollection = new OrderedPartCollection<AbstractDocumentCodec>();
             if (encryption != null)
             {
@@ -418,15 +595,16 @@ namespace Raven.StorageExporter
             if (hasCompression)
             {
                 orderedPartCollection.Add(new DocumentCompression());
-            }
-                
+            }                                       
             storage.Initialize(new SequentialUuidGenerator {EtagBase = 0}, orderedPartCollection);
+            
             return true;
         }
 
         public static bool ValidateStorageExists(string dataDir)
         {
             return File.Exists(Path.Combine(dataDir, Voron.Impl.Constants.DatabaseFilename))
+                   || File.Exists(Path.Combine(dataDir, "Data.ravenfs")) 
                    || File.Exists(Path.Combine(dataDir, "Data"));
         }
 
@@ -434,6 +612,14 @@ namespace Raven.StorageExporter
         private readonly string baseDirectory;
         private readonly string outputDirectory;
         private ITransactionalStorage storage;
+        private Database.FileSystem.Storage.ITransactionalStorage fileStorage;
         private readonly int batchSize;
+        
+
+        public void Dispose()
+        {
+            if (storage != null)
+                storage.Dispose();
+        }
     }
 }

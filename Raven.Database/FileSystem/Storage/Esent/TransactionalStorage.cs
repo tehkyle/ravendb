@@ -29,8 +29,8 @@ using Raven.Database.FileSystem.Plugins;
 using Raven.Database.FileSystem.Storage.Esent.Backup;
 using Raven.Database.FileSystem.Storage.Esent.Schema;
 using Raven.Database.Util;
+using Raven.Storage.Esent;
 using BackupOperation = Raven.Database.FileSystem.Storage.Esent.Backup.BackupOperation;
-using Raven.Abstractions.Threading;
 
 namespace Raven.Database.FileSystem.Storage.Esent
 {
@@ -39,8 +39,8 @@ namespace Raven.Database.FileSystem.Storage.Esent
         private readonly InMemoryRavenConfiguration configuration;
 
         private OrderedPartCollection<AbstractFileCodec> fileCodecs;
-        private readonly Raven.Abstractions.Threading.ThreadLocal<IStorageActionsAccessor> current = new Raven.Abstractions.Threading.ThreadLocal<IStorageActionsAccessor>();
-        private readonly Raven.Abstractions.Threading.ThreadLocal<object> disableBatchNesting = new Raven.Abstractions.Threading.ThreadLocal<object>();
+        private readonly ThreadLocal<IStorageActionsAccessor> current = new ThreadLocal<IStorageActionsAccessor>();
+        private readonly ThreadLocal<object> disableBatchNesting = new ThreadLocal<object>();
         private readonly string database;
         private readonly ReaderWriterLockSlim disposerLock = new ReaderWriterLockSlim();
         private readonly string path;
@@ -125,6 +125,9 @@ namespace Raven.Database.FileSystem.Storage.Esent
                         log.FatalException("Even ungraceful shutdown was unsuccessful, restarting the server process may be required", e2);
                     }
                 }
+
+                current.Dispose();
+                disableBatchNesting.Dispose();
             }
             finally
             {
@@ -565,6 +568,27 @@ namespace Raven.Database.FileSystem.Storage.Esent
         {
             Console.Write(message);
             Console.WriteLine();
+        }
+
+        public Guid ChangeId()
+        {
+            Guid newId = Guid.NewGuid();
+            instance.WithDatabase(database, (session, dbid, tx) =>
+            {
+                using (var details = new Table(session, dbid, "details", OpenTableGrbit.None))
+                {
+                    Api.JetMove(session, details, JET_Move.First, MoveGrbit.None);
+                    var columnids = Api.GetColumnDictionary(session, details);
+                    using (var update = new Update(session, details, JET_prep.Replace))
+                    {
+                        Api.SetColumn(session, details, columnids["id"], newId.ToByteArray());
+                        update.Save();
+                    }
+                }
+                return tx;
+            });
+            Id = newId;
+            return newId;
         }
     }
 }

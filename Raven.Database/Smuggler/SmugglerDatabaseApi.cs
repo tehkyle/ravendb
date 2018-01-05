@@ -55,13 +55,13 @@ namespace Raven.Smuggler
                     await new SmugglerDatabaseBetweenOperation
                     {
                         OnShowProgress = betweenOptions.ReportProgress
-        }
+                    }
                     .Between(new SmugglerBetweenOperations
                     {
                         From = exportOperations,
                         To = importOperations,
                         IncrementalKey = betweenOptions.IncrementalKey
-                    }, Options)
+                    }, Options, exportBulkOperation)
                     .ConfigureAwait(false);
                 }
             }
@@ -118,7 +118,8 @@ namespace Raven.Smuggler
                 {
                     MaxChunkVolumeInBytes = Options.TotalDocumentSizeInChunkLimitInBytes,
                     MaxDocumentsPerChunk = Options.ChunkSize
-                }
+                },
+                WriteTimeoutMilliseconds =  (int)Options.Timeout.TotalMilliseconds
             });
 
             result.Report += text => Operations.ShowProgress(text);
@@ -140,7 +141,8 @@ namespace Raven.Smuggler
             {
                 Url = connectionStringOptions.Url,
                 ApiKey = connectionStringOptions.ApiKey,
-                Credentials = credentials ?? CredentialCache.DefaultNetworkCredentials
+                Credentials = credentials ?? CredentialCache.DefaultNetworkCredentials,
+                AvoidCluster = true
             };
 
             s.Initialize();

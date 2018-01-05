@@ -133,7 +133,14 @@ namespace Raven.Client.Linq
                                 documentQuery.CloseSubclause();
                                 break;
                             default:
-                                throw new ArgumentOutOfRangeException(unaryExpressionOp.NodeType.ToString());
+                                //probably the case of !(complex condition)
+                                documentQuery.OpenSubclause();
+                                documentQuery.Where("*:*");
+                                documentQuery.AndAlso();
+                                documentQuery.NegateNext();
+                                VisitExpression(unaryExpressionOp);
+                                documentQuery.CloseSubclause();
+                                break;
                         }
                         break;
                     case ExpressionType.Convert:
@@ -853,18 +860,18 @@ The recommended method is to use full text search (mark the field as Analyzed an
                 VisitEnumerableMethodCall(expression, negated);
                 return;
             }
-            if (declaringType.IsGenericType() &&
-                declaringType.GetGenericTypeDefinition() == typeof(List<>))
-            {
-                VisitListMethodCall(expression);
-                return;
-            }
 
-            if (declaringType == typeof(LinqExtensions) ||
-                declaringType == typeof(RavenQueryableExtensions))
+            if (declaringType.IsGenericType())
             {
-                VisitLinqExtensionsMethodCall(expression);
-                return;
+                var genericTypeDefinition = declaringType.GetGenericTypeDefinition();
+                if (genericTypeDefinition == typeof(ICollection<>) ||
+                    genericTypeDefinition == typeof(List<>) ||
+                    genericTypeDefinition == typeof(IList<>) ||
+                    genericTypeDefinition == typeof(Array))
+                {
+                    VisitListMethodCall(expression);
+                    return;
+                }
             }
 
             var method = declaringType.Name + "." + expression.Method.Name;

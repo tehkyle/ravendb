@@ -16,6 +16,8 @@ namespace Raven.Database.Server
 {
     public sealed class RavenDBOptions : IDisposable
     {
+        private static readonly ILog log = LogManager.GetCurrentClassLogger();
+
         private readonly DatabasesLandlord databasesLandlord;
         private readonly MixedModeRequestAuthorizer mixedModeRequestAuthorizer;
         private readonly DocumentDatabase systemDatabase;
@@ -41,8 +43,16 @@ namespace Raven.Database.Server
                 HttpEndpointRegistration.RegisterAdminLogsTarget();
                 if (db == null)
                 {
-                    configuration.UpdateDataDirForLegacySystemDb();
-                    systemDatabase = new DocumentDatabase(configuration, null);
+                    configuration.UpdateDataDirForLegacySystemDb();                    
+                    systemDatabase = new DocumentDatabase(configuration, null, null, (sender, exception) =>
+                    {
+                        if (log.IsInfoEnabled)
+                        {
+                            log.ErrorException(
+                                @"Found errors in the system database while loading it for the first time.
+                                    This is recoverable error, since we will simply ingore transactions after the faulted one.",exception);
+                        }
+                    });
                     systemDatabase.SpinBackgroundWorkers(false);
                 }
                 else
@@ -67,10 +77,17 @@ namespace Raven.Database.Server
                 foreach (var task in serverStartupTasks)
                 {
                     toDispose.Add(task);
-                    task.Execute(this);
+                    try
+                    {
+                        task.Execute(this);
+                    }
+                    catch (Exception e)
+                    {
+                        systemDatabase.LogErrorAndAddAlertOnStartupTaskException(task.GetType().FullName, e);
+                    }
                 }
             }
-            catch (Exception)
+            catch (Exception e)
             {
                 if (systemDatabase != null)
                     systemDatabase.Dispose();

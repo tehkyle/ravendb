@@ -42,9 +42,9 @@ namespace Raven.Storage.Esent
     public class TransactionalStorage : CriticalFinalizerObject, ITransactionalStorage
     {
         private static int instanceCounter;
-        private readonly Raven.Abstractions.Threading.ThreadLocal<StorageActionsAccessor> current = new Raven.Abstractions.Threading.ThreadLocal<StorageActionsAccessor>();
-        private readonly Raven.Abstractions.Threading.ThreadLocal<object> disableBatchNesting = new Raven.Abstractions.Threading.ThreadLocal<object>();
-        private readonly Raven.Abstractions.Threading.ThreadLocal<EsentTransactionContext> dtcTransactionContext = new Raven.Abstractions.Threading.ThreadLocal<EsentTransactionContext>();
+        private readonly ThreadLocal<StorageActionsAccessor> current = new ThreadLocal<StorageActionsAccessor>();
+        private readonly ThreadLocal<object> disableBatchNesting = new ThreadLocal<object>();
+        private readonly ThreadLocal<EsentTransactionContext> dtcTransactionContext = new ThreadLocal<EsentTransactionContext>();
         private readonly string database;
         private readonly InMemoryRavenConfiguration configuration;
         private readonly Action onCommit;
@@ -88,10 +88,18 @@ namespace Raven.Storage.Esent
             configuration.Container.SatisfyImportsOnce(this);
 
             if (configuration.CacheDocumentsInMemory == false)
+            {
                 documentCacher = new NullDocumentCacher();
+            }
+            else if (configuration.CustomMemoryCacher != null)
+            {
+                documentCacher = configuration.CustomMemoryCacher(configuration);
+            }
             else
-                documentCacher = new DocumentCacher(configuration);    
-            
+            {
+                documentCacher = new DocumentCacher(configuration);
+            }
+
             database = configuration.DataDirectory;
             this.configuration = configuration;
             this.onCommit = onCommit;
@@ -195,6 +203,10 @@ namespace Raven.Storage.Esent
                         }
                     });
 
+                exceptionAggregator.Execute(current.Dispose);
+                exceptionAggregator.Execute(disableBatchNesting.Dispose);
+                exceptionAggregator.Execute(dtcTransactionContext.Dispose);
+
                 exceptionAggregator.ThrowIfNeeded();
             }
             catch (Exception e)
@@ -219,9 +231,9 @@ namespace Raven.Storage.Esent
                 .StartNew(backupOperation.Execute);
         }
 
-        public void Restore(DatabaseRestoreRequest restoreRequest, Action<string> output)
+        public void Restore(DatabaseRestoreRequest restoreRequest, Action<string> output,InMemoryRavenConfiguration globalConfiguration)
         {
-            new RestoreOperation(restoreRequest, configuration, output).Execute();
+            new RestoreOperation(restoreRequest, configuration,globalConfiguration, output).Execute();
         }
 
         public DatabaseSizeInformation GetDatabaseSize()
@@ -383,7 +395,7 @@ namespace Raven.Storage.Esent
         private static void CompactInternal(InMemoryRavenConfiguration ravenConfiguration, JET_PFNSTATUS statusCallback)
         {
             var src = Path.Combine(ravenConfiguration.DataDirectory, "Data");
-            var compactPath = Path.Combine(ravenConfiguration.DataDirectory, "Data.Compact");
+            var compactPath = Path.Combine(ravenConfiguration.DataDirectory, "Compacted.Data");
 
             if (File.Exists(compactPath))
                 File.Delete(compactPath);
@@ -404,7 +416,12 @@ namespace Raven.Storage.Esent
                     try
                     {
                         Api.JetCompact(session, src, compactPath, statusCallback, null,
-                                   CompactGrbit.None);
+                            CompactGrbit.None);
+                    }
+                    catch (Exception e)
+                    {
+                        Console.WriteLine(e);
+                        throw;
                     }
                     finally
                     {
@@ -492,7 +509,7 @@ namespace Raven.Storage.Esent
             SystemParameters.CacheSizeMax = cacheSizeMax;
         }
 
-        public void Initialize(IUuidGenerator uuidGenerator, OrderedPartCollection<AbstractDocumentCodec> documentCodecs, Action<string> putResourceMarker = null)
+        public void Initialize(IUuidGenerator uuidGenerator, OrderedPartCollection<AbstractDocumentCodec> documentCodecs, Action<string> putResourceMarker = null, Action<object, Exception> onErrorAction = null)
         {
             try
             {
@@ -523,6 +540,7 @@ namespace Raven.Storage.Esent
             }
             catch (Exception e)
             {
+                onErrorAction?.Invoke(this, e);
                 Dispose();
                 var fileAccessException = e as EsentFileAccessDeniedException;
                 if (fileAccessException == null)

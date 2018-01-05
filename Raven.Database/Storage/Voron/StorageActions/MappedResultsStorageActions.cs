@@ -523,16 +523,9 @@ namespace Raven.Database.Storage.Voron.StorageActions
         public IList<MappedResultInfo> GetItemsToReduce(GetItemsToReduceParams getItemsToReduceParams, CancellationToken cancellationToken)
         {
             var scheduledReductionsByViewAndLevelAndReduceKey = tableStorage.ScheduledReductions.GetIndex(Tables.ScheduledReductions.Indices.ByViewAndLevelAndReduceKey);
-            var deleter = new ScheduledReductionDeleter(getItemsToReduceParams.ItemsToDelete, o =>
-            {
-                var etag = o as Etag;
-                if (etag == null)
-                    return null;
+            var deleter = new ScheduledReductionDeleter(getItemsToReduceParams.ItemsToDelete);
 
-                return (Slice)etag.ToString();
-            });
-
-            var keysToRemove = new List<string>();
+            var keysToRemove = new HashSet<string>();
 
             try
             {
@@ -592,19 +585,21 @@ namespace Raven.Database.Storage.Voron.StorageActions
 
                             var thisIsNewScheduledReductionRow = deleter.Delete(iterator.CurrentKey, Etag.Parse(value.ReadBytes(ScheduledReductionFields.Etag)));
 
-                            if (thisIsNewScheduledReductionRow)
-                            {
-                                if (seenLocally.Add(rowKey))
-                                {
-                                    getItemsToReduceParams.LastReduceKeyAndBucket = rowKey;
-                                    foreach (var mappedResultInfo in GetResultsForBucket(getItemsToReduceParams.Index, getItemsToReduceParams.Level, reduceKeyFromDb, bucket, getItemsToReduceParams.LoadData, cancellationToken))
-                                    {
-                                        getItemsToReduceParams.Take--;
+                            if (thisIsNewScheduledReductionRow == false)
+                                continue;
 
-                                        mappedResults.Add(mappedResultInfo);
-                                    }
+                            if (seenLocally.Add(rowKey))
+                            {
+                                getItemsToReduceParams.LastReduceKeyAndBucket = rowKey;
+                                foreach (var mappedResultInfo in GetResultsForBucket(getItemsToReduceParams.Index, getItemsToReduceParams.Level, reduceKeyFromDb, bucket, getItemsToReduceParams.LoadData, cancellationToken))
+                                {
+                                    getItemsToReduceParams.Take--;
+
+                                    mappedResults.Add(mappedResultInfo);
                                 }
                             }
+
+                            keysToRemove.Add(reduceKey);
                         }
                         while (iterator.MoveNext());
                     }
@@ -1388,33 +1383,27 @@ namespace Raven.Database.Storage.Voron.StorageActions
     {
         private readonly ConcurrentSet<object> innerSet;
 
-        private readonly IDictionary<Slice, object> state = new Dictionary<Slice, object>(new SliceComparer());
+        private readonly HashSet<Etag> state = new HashSet<Etag>();
 
-        public ScheduledReductionDeleter(ConcurrentSet<object> set, Func<object, Slice> extractKey)
+        public ScheduledReductionDeleter(ConcurrentSet<object> set)
         {
             innerSet = set;
 
-            InitializeState(set, extractKey);
-        }
-
-        private void InitializeState(IEnumerable<object> set, Func<object, Slice> extractKey)
-        {
             foreach (var item in set)
             {
-                var key = extractKey(item);
+                var key = item as Etag;
                 if (key == null)
                     continue;
 
-                state.Add(key, null);
+                state.Add(key);
             }
         }
 
-        public bool Delete(Slice key, object value)
+        public bool Delete(Slice key, Etag value)
         {
-            if (state.ContainsKey(key))
+            if (state.Add(value) == false)
                 return false;
 
-            state.Add(key, null);
             innerSet.Add(value);
 
             return true;

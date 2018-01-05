@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using Rachis.Messages;
+using Rachis.Storage;
 using Rachis.Transport;
 using Raven.Abstractions.Extensions;
 using Raven.Abstractions.Util;
@@ -30,6 +31,10 @@ namespace Rachis
             Elections = new ConcurrentQueue<ElectionInformation>();
             CommitTimes = new ConcurrentQueue<CommitInformation>();
         }
+
+        public LogEntry LastLogEntry { get; set; }
+        public List<LogEntry> LastLogsEntries { get; set; }
+        public long CommitIndex { get; set; }
         private ConcurrentDictionary<long, DateTime> IndexesToAppendTimes = new ConcurrentDictionary<long, DateTime>(); 
         public ConcurrentQueue<TimeoutInformation> TimeOuts { get; }
         public ConcurrentQueue<ElectionInformation> Elections { get; } 
@@ -37,6 +42,9 @@ namespace Rachis
         public ConcurrentQueue<MessageWithTimingInformation> Messages { get; }
         public ElectionInformation LastElectionInformation => Elections.LastOrDefault();
         public ConcurrentQueue<CommitInformation> CommitTimes { get; } 
+
+        public Topology CurrenTopology { get; set; }
+
         public string Name { get; set; }
 
         public int MaxLogLengthBeforeCompaction { get; set; }
@@ -46,7 +54,9 @@ namespace Rachis
         public int HeartbeatTimeout { get; set; }
 
         public int ElectionTimeout { get; set; }
-
+        public string CurrentLeader { get; set; }
+        public long CurrentTerm { get; set; }
+        public FollowerLastSentEntries FollowersStatistics = null;
         public void ReportIndexAppend(long index)
         {
             IndexesToAppendTimes[index] = DateTime.UtcNow;
@@ -61,6 +71,16 @@ namespace Rachis
                 ,NumberOfCommitsToTrack);
             }            
         }
+    }
+
+    public class FollowerLastSentEntries
+    {
+        public FollowerLastSentEntries(ConcurrentDictionary<string, long> f2e)
+        {
+            FollowersToLastSent = f2e;
+        }
+        public readonly ConcurrentDictionary<string,long> FollowersToLastSent;
+        public long MaxQuorumIndex { get; set; }
     }
 
     public class TimeoutInformation

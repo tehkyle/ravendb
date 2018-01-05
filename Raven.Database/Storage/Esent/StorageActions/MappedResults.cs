@@ -25,7 +25,7 @@ namespace Raven.Database.Storage.Esent.StorageActions
 {
     public partial class DocumentStorageActions : IMappedResultsStorageAction
     {
-        private static readonly Raven.Abstractions.Threading.ThreadLocal<IHashEncryptor> localSha1 = new Raven.Abstractions.Threading.ThreadLocal<IHashEncryptor>(() => Encryptor.Current.CreateHash());
+        private static readonly ThreadLocal<IHashEncryptor> localSha1 = new ThreadLocal<IHashEncryptor>(() => Encryptor.Current.CreateHash());
         private readonly ConcurrentDictionary<int, RemainingReductionPerLevel> scheduledReductionsPerViewAndLevel;
         public static byte[] HashReduceKey(string reduceKey)
         {
@@ -287,7 +287,7 @@ namespace Raven.Database.Storage.Esent.StorageActions
             var reduceReductionColumn = tableColumnsCache.ScheduledReductionColumns["reduce_key"];
             var bucketReductionColumn = tableColumnsCache.ScheduledReductionColumns["bucket"];
 
-            var keysToRemove = new List<string>();
+            var keysToRemove = new HashSet<string>();
             var output = new List<MappedResultInfo>();
             var seenLocally = new HashSet<ReduceKeyAndBucket>(ReduceKeyAndBucketEqualityComparer.Instance);
             

@@ -19,13 +19,13 @@ using ThreadState = System.Threading.ThreadState;
 
 namespace Raven.Database.Config
 {
-    internal interface ILowMemoryHandler
+    public interface ILowMemoryHandler
     {
         LowMemoryHandlerStatistics HandleLowMemory();
         LowMemoryHandlerStatistics GetStats();
     }
 
-    internal static class MemoryStatistics
+    public static class MemoryStatistics
     {
         private static readonly ILog Log = LogManager.GetCurrentClassLogger();
 
@@ -237,10 +237,11 @@ namespace Raven.Database.Config
                     }
                     catch (Exception e)
                     {
-                        Log.Error("Failure to process low memory notification (low memory handler - " + handler + ")", e);
+                        Log.ErrorException("Failure to process low memory notification (low memory handler - " + handler + ")", e);
                     }
                 }
-
+                else
+                    inactiveHandlers.Add(lowMemoryHandler);
             }
             stats.Duration = sp.Elapsed;
             LowMemoryCallRecords.Enqueue(stats);
@@ -263,7 +264,7 @@ namespace Raven.Database.Config
                     }
                     catch (Exception e)
                     {
-                        Log.Error("Failure to process low memory notification (low memory handler - " + handler + ")", e);
+                        Log.ErrorException("Failure to process low memory notification (low memory handler - " + handler + ")", e);
                     }
                 }
                 else

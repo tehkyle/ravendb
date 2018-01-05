@@ -63,6 +63,8 @@ namespace Voron
 
         public long MaxScratchBufferSize { get; set; }
 
+        public long MaxSizePerScratchBufferFile { get; set; }
+
         public long MaxNumberOfPagesInMergedTransaction { get; set; }
 
         public bool OwnsPagers { get; set; }
@@ -100,6 +102,8 @@ namespace Voron
             InitialLogFileSize = 64 * 1024;
 
             MaxScratchBufferSize = 512 * 1024 * 1024;
+
+            MaxSizePerScratchBufferFile = 256 * 1024 * 1024;
 
             ScratchBufferOverflowTimeout = 5000;
 
@@ -209,7 +213,19 @@ namespace Voron
                     return new Win32FileJournalWriter(path, journalSize);
                 }));
 
-                if (result.Value.Disposed)
+                var createJournal = false;
+                try
+                {
+                    createJournal = result.Value.Disposed;
+                }
+                catch
+                {
+                    Lazy<IJournalWriter> _;
+                    _journals.TryRemove(name, out _);
+                    throw;
+                }
+
+                if (createJournal)
                 {
                     var newWriter = new Lazy<IJournalWriter>(() =>
                     {
@@ -298,14 +314,38 @@ namespace Voron
             {
                 var name = JournalName(journalNumber);
                 var path = Path.Combine(_journalPath, name);
-                if (File.Exists(path) == false)
+
+                var fileInfo = new FileInfo(path);
+                if (fileInfo.Exists == false)
                     throw new InvalidOperationException("No such journal " + path);
+                if (fileInfo.Length < InitialLogFileSize)
+                {
+                    EnsureMinimumSize(fileInfo, path);
+                }
+
                 if (RunningOnPosix)
                     return new PosixMemoryMapPager(path);
                 var win32MemoryMapPager = new Win32MemoryMapPager(path, access: Win32NativeFileAccess.GenericRead, 
                     options:Win32NativeFileAttributes.SequentialScan);
                 win32MemoryMapPager.TryPrefetchingWholeFile();
                 return win32MemoryMapPager;
+            }
+        }
+
+        private void EnsureMinimumSize(FileInfo fileInfo, string path)
+        {
+            try
+            {
+                using (var stream = fileInfo.Open(FileMode.OpenOrCreate))
+                {
+                    stream.SetLength(InitialLogFileSize);
+                }
+            }
+            catch (Exception e)
+            {
+                throw new InvalidOperationException(
+                    "Journal file " + path + " could not be opened because it's size is too small and we couldn't increase it",
+                    e);
             }
         }
 
@@ -434,7 +474,7 @@ namespace Voron
                 return new Win32MemoryMapPager(filename);
             }
 
-            public override IVirtualPager OpenJournalPager(long journalNumber)
+            public override IVirtualPager OpenJournalPager(long journalNumber) 
             {
                 var name = JournalName(journalNumber);
                 IJournalWriter value;

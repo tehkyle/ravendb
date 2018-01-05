@@ -23,11 +23,15 @@ using Raven.Abstractions.MEF;
 using Raven.Database.Config;
 using Raven.Database.Linq;
 using Raven.Database.Plugins;
+using Raven.Json.Linq;
 
 namespace Raven.Database.Storage
 {
     public class IndexDefinitionStorage
     {
+        public const string IndexVersionKey = "IndexVersion";
+        public const string TransformerVersionKey = "TransformerVersion";
+
         private const string IndexDefDir = "IndexDefinitions";
 
         private readonly ReaderWriterLockSlim currentlyIndexingLock = new ReaderWriterLockSlim(LockRecursionPolicy.SupportsRecursion);
@@ -436,8 +440,9 @@ namespace Raven.Database.Storage
         public AbstractViewGenerator GetViewGenerator(string name)
         {
             int id = 0;
-            if (indexNameToId.TryGetValue(name, out id))
-                return indexCache[id];
+            AbstractViewGenerator viewGenerator;
+            if (indexNameToId.TryGetValue(name, out id) && indexCache.TryGetValue(id, out viewGenerator))
+                return viewGenerator;
             return null;
         }
 
@@ -514,15 +519,16 @@ namespace Raven.Database.Storage
                     if (version >= currentIndexVersion)
                     {
                         if (version > currentIndexVersion)
-                            logger.Error("Trying to add an index ({0}) with a version smaller " +
-                                         "than the deleted version, this should not happen", indexName);
+                            logger.Error("Trying to add an index ({0}) with a version smaller ({1})" +
+                                         "than the deleted version ({2}), this should not happen", indexName, currentIndexVersion, version);
 
                         res = true;
                     }
                 }
                 else
                 {
-                    logger.Error("Failed to parse index version of index {0}", indexName);
+                    logger.Error("Failed to parse index version of index {0} using {1} list. " +
+                                 "Got the following value: {2}. Current index version: {3}", indexName, listName, versionStr, currentIndexVersion);
                 }
             });
 
@@ -530,19 +536,25 @@ namespace Raven.Database.Storage
             return res;
         }
 
-        public int GetDeletedIndexVersion(IndexDefinition definition)
+        public int GetDeletedIndexVersion(string indexName, int indexId)
         {
-            var currentIndexVersion = definition.IndexVersion ?? 0;
+            // we only need the deleted index version if exists
+            // no need to log an error
             int indexVersionFromTombstones;
-            CheckIfIndexVersionIsEqualOrSmaller(Constants.RavenReplicationIndexesTombstones, 
-                definition.Name, currentIndexVersion, definition.Name, out indexVersionFromTombstones);
+            CheckIfIndexVersionIsEqualOrSmaller(Constants.RavenReplicationIndexesTombstones,
+                indexName, int.MaxValue, indexName, out indexVersionFromTombstones);
 
             int indexVersionFromPendingDeletions;
-            CheckIfIndexVersionIsEqualOrSmaller("Raven/Indexes/PendingDeletion", 
-                definition.IndexId.ToString(CultureInfo.InvariantCulture), 
-                currentIndexVersion, definition.Name, out indexVersionFromPendingDeletions);
+            CheckIfIndexVersionIsEqualOrSmaller("Raven/Indexes/PendingDeletion",
+                indexId.ToString(CultureInfo.InvariantCulture), 
+                int.MaxValue, indexName, out indexVersionFromPendingDeletions);
 
-            return Math.Max(indexVersionFromTombstones, indexVersionFromPendingDeletions);
+            var result = Math.Max(indexVersionFromTombstones, indexVersionFromPendingDeletions);
+
+            int deletedIndexVersion;
+            CheckIfIndexVersionIsEqualOrSmaller(Constants.RavenDeletedIndexesVersions,
+                indexName, int.MaxValue, indexName, out deletedIndexVersion);
+            return Math.Max(result, deletedIndexVersion);
         }
 
         public bool Contains(string indexName)
@@ -598,6 +610,7 @@ namespace Raven.Database.Storage
             var transformer = GetTransformerDefinition(name);
             if (transformer == null)
                 return false;
+
             RemoveTransformer(transformer.TransfomerId);
 
             return true;
@@ -641,7 +654,11 @@ namespace Raven.Database.Storage
         {
             int id = 0;
             if (transformNameToId.TryGetValue(name, out id))
-                return transformCache[id];
+            {
+                AbstractTransformer value;
+                if (transformCache.TryGetValue(id, out value))
+                    return value;
+            }
             return null;
         }
 
@@ -681,12 +698,8 @@ namespace Raven.Database.Storage
             else
             {
                 index.Name = indexToSwapName;
-
-                int indexVersionFromTombstones;
-                CheckIfIndexVersionIsEqualOrSmaller(Constants.RavenReplicationIndexesTombstones,
-                    indexToSwapName, 0, indexToSwapName, out indexVersionFromTombstones);
-
-                index.IndexVersion = indexVersionFromTombstones + 1;
+                var deletedIndexVersion = GetDeletedIndexVersion(indexToSwapName, indexId: 0);
+                index.IndexVersion = deletedIndexVersion + 1;
             }
 
             index.Name = indexToReplace != null ? indexToReplace.Name : indexToSwapName;

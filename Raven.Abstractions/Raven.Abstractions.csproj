@@ -278,6 +278,7 @@
     <Compile Include="Exceptions\InvalidSpatialShapeException.cs" />
     <Compile Include="Exceptions\SmugglerException.cs" />
     <Compile Include="Exceptions\SmugglerExportException.cs" />
+    <Compile Include="Exceptions\Subscriptions\SubscriptionAckTimeoutException.cs" />
     <Compile Include="Exceptions\Subscriptions\SubscriptionClosedException.cs" />
     <Compile Include="Exceptions\Subscriptions\SubscriptionDoesNotExistException.cs" />
     <Compile Include="Exceptions\Subscriptions\SubscriptionInUseException.cs" />
@@ -307,6 +308,9 @@
     <Compile Include="Extensions\ListExtensions.cs" />
     <Compile Include="Extensions\MemberInfoExtensions.cs" />
     <Compile Include="Extensions\RavenDateTimeExtensions.cs" />
+    <Compile Include="MEF\DisableTriggerState.cs" />
+    <Compile Include="Smuggler\Data\FilesUploadWorker.cs" />
+    <Compile Include="Smuggler\Data\SmugglerDataFormat.cs" />
     <Compile Include="Util\InterlockedLock.cs" />
     <Compile Include="Extensions\StringExtensions.cs" />
     <Compile Include="Extensions\ReflectionExtensions.cs" />
@@ -521,8 +525,8 @@
     <Compile Include="Util\Streams\NoBufferPool.cs" />
     <Compile Include="Util\Streams\Substream.cs" />
     <Compile Include="Util\MalformedLineException.cs" />
-    <Compile Include="Threading\ThreadLocal.cs" />
     <Compile Include="Util\UndisposableStream.cs" />
+    <Compile Include="Util\WildcardMatcher.cs" />
   </ItemGroup>
   <ItemGroup>
     <EmbeddedResource Include="..\Imports\Newtonsoft.Json\Src\Newtonsoft.Json\Dynamic.snk">

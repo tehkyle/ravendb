@@ -90,6 +90,13 @@ namespace Raven.Database.Server.Controllers
                         });
                 }
 
+                //take "snapshots" of NextIndexingRound TaskCompletionSource's --> prevent a race condition
+                //between NextIndexingRound completion after the Batch() execution and waiting for it's completion in WaitForIndexesAsync()
+                var nextIndexingRoundsByIndexId = new Dictionary<int, Task>();
+                var existingIndexes = Database.IndexStorage.GetAllIndexes().ToArray();
+                foreach (var index in existingIndexes)
+                    nextIndexingRoundsByIndexId.Add(index.indexId,index.NextIndexingRound);
+
                 var batchResult = Database.Batch(commands, cts.Token);
 
                 var writeAssurance = GetHeader("Raven-Write-Assurance");
@@ -101,14 +108,16 @@ namespace Raven.Database.Server.Controllers
                 var waitIndexes = GetHeader("Raven-Wait-Indexes");
                 if (waitIndexes != null)
                 {
-                    await WaitForIndexesAsync(waitIndexes, batchResult).ConfigureAwait(false);
+                    //take care to pass existing indexes, in case any index is added or removed between Database.Batch() and WaitForIndexesAsync()
+                    //(essentially create "snapshot" of indexes just before the Batch() execution)
+                    await WaitForIndexesAsync(waitIndexes, nextIndexingRoundsByIndexId, existingIndexes, batchResult).ConfigureAwait(false);
                 }
 
                 return GetMessageWithObject(batchResult);
             }
         }
 
-        private async Task WaitForIndexesAsync(string waitIndexes, BatchResult[] results)
+        private async Task WaitForIndexesAsync(string waitIndexes, Dictionary<int,Task> nextIndexingRoundsByIndexId,Index[] existingIndexes, BatchResult[] results)
         {
             var parts = waitIndexes.Split(new [] {';'},StringSplitOptions.RemoveEmptyEntries);
             var throwOnTimeout = bool.Parse(parts[0]);
@@ -118,8 +127,12 @@ namespace Raven.Database.Server.Controllers
             Etag lastEtag = null;
             var allIndexes = false;
             var modifiedCollections = new HashSet<string>();
+            var deletedIds = new HashSet<string>();
             foreach (var batchResult in results)
             {
+                if (batchResult.Method == "DELETE")
+                    deletedIds.Add(batchResult.Key);
+
                 if (batchResult.Etag == null || batchResult.Metadata == null)
                     continue;
 
@@ -134,26 +147,42 @@ namespace Raven.Database.Server.Controllers
             }
 
             if (lastEtag == null)
+            {
+                if (deletedIds.Count > 0)
+                {
+                    while (Database.WorkContext.IndexRemovalQueueContainsAnyFrom(deletedIds))
+                        await Task.Delay(100).ConfigureAwait(false);
+                }
                 return;
+            }
 
             var indexes = new List<Index>();
-            foreach (var index in Database.IndexStorage.GetAllIndexes())
+            foreach (var index in existingIndexes)
             {
                 if (specificIndexes.Count > 0)
                 {
-                    if(specificIndexes.Contains(index.PublicName) == false)
+                    if (specificIndexes.Contains(index.PublicName) == false)
+                    {
+                        nextIndexingRoundsByIndexId.Remove(index.indexId);
                         continue;
+                    }
                 }
 
-                if (allIndexes && index.ViewGenerator.ForEntityNames.Count == 0)
+                if (allIndexes && index.ViewGenerator.ForEntityNames.Count == 0
+                    || index.ViewGenerator.ForEntityNames.Overlaps(modifiedCollections))
+                {
                     indexes.Add(index);
-                if (index.ViewGenerator.ForEntityNames.Overlaps(modifiedCollections))
-                    indexes.Add(index);
+                }
+                else
+                {
+                    nextIndexingRoundsByIndexId.Remove(index.indexId);
+                }
             }
 
             var sp = Stopwatch.StartNew();
             var needToWait = true;
             var tasks = new Task[indexes.Count + 1];
+            var indexingRounds = nextIndexingRoundsByIndexId.Values.ToList();
             do
             {
                 needToWait = false;
@@ -171,12 +200,13 @@ namespace Raven.Database.Server.Controllers
 
                 if (needToWait)
                 {
+
                     for (int i = 0; i < indexes.Count; i++)
                     {
-                        tasks[i] = indexes[i].NextIndexingRound;
+                        tasks[i] = indexingRounds[i];
                     }
                     var timeSpan = timeout - sp.Elapsed;
-                    if (timeout < TimeSpan.Zero)
+                    if (timeout < TimeSpan.Zero || timeSpan <= TimeSpan.Zero)
                     {
                         if (throwOnTimeout)
                         {
@@ -220,10 +250,20 @@ namespace Raven.Database.Server.Controllers
                 }
                 return;
             }
-            if (lastResultWithEtag != null)
+            //what can we do if we don't have this?
+            if (lastResultWithEtag == null)
+                return;
+
+            int numberOfReplicasToWaitFor = majority ? replicationTask.GetSizeOfMajorityFromActiveReplicationDestination(replicas) : replicas;
+
+            var numberOfReplicatesPast = await replicationTask.WaitForReplicationAsync(lastResultWithEtag.Etag, timeout, numberOfReplicasToWaitFor).ConfigureAwait(false);
+
+            if (numberOfReplicatesPast < numberOfReplicasToWaitFor && throwOnTimeout)
             {
-                await replicationTask.WaitForReplicationAsync(lastResultWithEtag.Etag, timeout, replicas, majority, throwOnTimeout).ConfigureAwait(false);
+                throw new TimeoutException(
+                    $"Could not verify that etag {lastResultWithEtag.Etag} was replicated to {numberOfReplicasToWaitFor} servers in {timeout}. So far, it only replicated to {numberOfReplicatesPast}");
             }
+            //If we got here than we are either ignoring timeouts or we finished replicating to the required amount of servers.
         }
 
         [HttpDelete]
@@ -349,10 +389,15 @@ namespace Raven.Database.Server.Controllers
             {
                 using (DocumentCacher.SkipSetDocumentsInDocumentCache())
                 {
-                    status.State["Batch"] = batchOperation(index, indexQuery, option, x =>
+                    var batchResult = batchOperation(index, indexQuery, option, x =>
                     {
                         status.MarkProgress(x);
                     });
+
+                    lock (status.State)
+                    {
+                        status.State["Batch"] = batchResult;
+                    }
                 }
 
             }).ContinueWith(t =>

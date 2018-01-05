@@ -11,6 +11,7 @@ using System.ComponentModel.Composition.Hosting;
 using System.ComponentModel.Composition.Primitives;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
@@ -27,6 +28,7 @@ using Raven.Database.Util;
 using Raven.Imports.Newtonsoft.Json;
 using Enum = System.Enum;
 using Raven.Abstractions;
+using Raven.Database.Impl;
 
 namespace Raven.Database.Config
 {
@@ -173,6 +175,24 @@ namespace Raven.Database.Config
 
             MemoryCacheLimitCheckInterval = ravenSettings.MemoryCacheLimitCheckInterval.Value;
 
+            if (!string.IsNullOrWhiteSpace(ravenSettings.MemoryCacher.Value))
+            {
+                CustomMemoryCacher = config =>
+                {
+                    var customCacherType = Type.GetType(ravenSettings.MemoryCacher.Value);
+
+                    var argTypes = new Type[] { typeof(InMemoryRavenConfiguration) };
+                    var argValues = new object[] { config };
+
+                    var ctor = customCacherType.GetConstructor(argTypes);
+                    var obj = ctor.Invoke(argValues);
+
+                    var cacher = obj as IDocumentCacher;
+
+                    return cacher;
+                };
+            }
+
             // Discovery
             DisableClusterDiscovery = ravenSettings.DisableClusterDiscovery.Value;
 
@@ -264,8 +284,6 @@ namespace Raven.Database.Config
                 IndexStoragePath = indexStoragePathSettingValue;
             }
 
-            MaxRecentTouchesToRemember = ravenSettings.MaxRecentTouchesToRemember.Value;
-
             // HTTP settings
             HostName = ravenSettings.HostName.Value;
 
@@ -311,13 +329,13 @@ namespace Raven.Database.Config
                 CustomTaskScheduler = (TaskScheduler)Activator.CreateInstance(type);
             }
 
-            AllowLocalAccessWithoutAuthorization = ravenSettings.AllowLocalAccessWithoutAuthorization.Value;
             RejectClientsMode = ravenSettings.RejectClientsModeEnabled.Value;
 
             // Voron settings
             Storage.Voron.MaxBufferPoolSize = Math.Max(2, ravenSettings.Voron.MaxBufferPoolSize.Value);
             Storage.Voron.InitialFileSize = ravenSettings.Voron.InitialFileSize.Value;
             Storage.Voron.MaxScratchBufferSize = ravenSettings.Voron.MaxScratchBufferSize.Value;
+            Storage.Voron.MaxSizePerScratchBufferFile = ravenSettings.Voron.MaxSizePerScratchBufferFile.Value;
             Storage.Voron.ScratchBufferSizeNotificationThreshold = ravenSettings.Voron.ScratchBufferSizeNotificationThreshold.Value;
             Storage.Voron.AllowIncrementalBackups = ravenSettings.Voron.AllowIncrementalBackups.Value;
             Storage.Voron.TempPath = ravenSettings.Voron.TempPath.Value;
@@ -353,6 +371,7 @@ namespace Raven.Database.Config
             FileSystem.IndexStoragePath = ravenSettings.FileSystem.IndexStoragePath.Value;
             if (string.IsNullOrEmpty(FileSystem.DefaultStorageTypeName))
                 FileSystem.DefaultStorageTypeName = ravenSettings.FileSystem.DefaultStorageTypeName.Value;
+            FileSystem.DisableRDC = ravenSettings.FileSystem.DisableRDC.Value;
 
             Studio.AllowNonAdminUsersToSetupPeriodicExport = ravenSettings.Studio.AllowNonAdminUsersToSetupPeriodicExport.Value;
 
@@ -845,14 +864,7 @@ namespace Raven.Database.Config
         /// Default: Get
         /// </summary>
         public AnonymousUserAccessMode AnonymousUserAccessMode { get; set; }
-
-        /// <summary>
-        /// If set local request don't require authentication
-        /// Allowed values: true/false
-        /// Default: false
-        /// </summary>
-        public bool AllowLocalAccessWithoutAuthorization { get; set; }
-
+        
         /// <summary>
         /// If set all client request to the server will be rejected with 
         /// the http 503 response.
@@ -1028,7 +1040,7 @@ namespace Raven.Database.Config
         [JsonIgnore]
         public CompositionContainer Container
         {
-            get { return container ?? (container = new CompositionContainer(Catalog)); }
+            get { return container ?? (container = new CompositionContainer(Catalog, CompositionOptions.IsThreadSafe)); }
             set
             {
                 containerExternallySet = true;
@@ -1086,6 +1098,11 @@ namespace Raven.Database.Config
         /// Limit of how much memory a batch processing can take (in MBytes)
         /// </summary>
         public int MemoryLimitForProcessingInMb { get; set; }
+
+        /// <summary>
+        /// Custom MemoryCacher type to use for caching database documents.
+        /// </summary>
+        public Func<InMemoryRavenConfiguration, IDocumentCacher> CustomMemoryCacher { get; set; }
 
         public long DynamicMemoryLimitForProcessing
         {
@@ -1150,12 +1167,6 @@ namespace Raven.Database.Config
         /// Default: 10,000
         /// </summary>
         public int MaxStepsForScript { get; set; }
-
-        /// <summary>
-        /// The maximum number of recent document touches to store (i.e. updates done in
-        /// order to initiate indexing rather than because something has actually changed).
-        /// </summary>
-        public int MaxRecentTouchesToRemember { get; set; }
 
         /// <summary>
         /// The number of additional steps to add to a given script based on the processed document's quota.
@@ -1432,7 +1443,7 @@ namespace Raven.Database.Config
             Port = defaultConfiguration.Port;
             OAuthTokenKey = defaultConfiguration.OAuthTokenKey;
             OAuthTokenServer = defaultConfiguration.OAuthTokenServer;
-
+            Replication.ReplicationPropagationDelayInSeconds = defaultConfiguration.Replication.ReplicationPropagationDelayInSeconds;
             FileSystem.MaximumSynchronizationInterval = defaultConfiguration.FileSystem.MaximumSynchronizationInterval;
 
             Encryption.UseSsl = defaultConfiguration.Encryption.UseSsl;
@@ -1495,6 +1506,12 @@ namespace Raven.Database.Config
                 /// Default: 6144.
                 /// </summary>
                 public int MaxScratchBufferSize { get; set; }
+
+                /// <summary>
+                /// The maximum per scratch buffer file size. The value is in megabytes. 
+                /// Default: 256.
+                /// </summary>
+                public int MaxSizePerScratchBufferFile { get; set; }
 
                 /// <summary>
                 /// The minimum number of megabytes after which each scratch buffer size increase will create a notification. Used for indexing batch size tuning.
@@ -1656,6 +1673,9 @@ namespace Raven.Database.Config
 
                 return EsentTypeName; // We choose esent by default
             }
+
+
+            public bool DisableRDC { get; set; }
         }
 
         public class StudioConfiguration

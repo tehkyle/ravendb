@@ -11,10 +11,13 @@ namespace Raven.Abstractions.Data
     {
         public long FreePagesOverhead;
         public long RootPages;
+        public long NumberOfAllocatedPages;
+        public long NextPageNumber;
         public long UnallocatedPagesAtEndOfFile;
         public long UsedDataFileSizeInBytes;
         public long AllocatedDataFileSizeInBytes;
         public long NextWriteTransactionId;
         public List<VoronActiveTransaction> ActiveTransactions;
+        public object ScratchBufferPoolInfo;
     }
 }

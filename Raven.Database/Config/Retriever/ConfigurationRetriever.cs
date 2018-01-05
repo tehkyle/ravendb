@@ -14,32 +14,33 @@ using Raven.Database.Commercial;
 using Raven.Database.Util;
 using Raven.Json.Linq;
 using System.Linq;
+using Sparrow.Collections;
 
 namespace Raven.Database.Config.Retriever
 {
-    public class ConfigurationRetriever
+    public class ConfigurationRetriever : IDisposable
     {
         private readonly DocumentDatabase systemDatabase;
 
         private readonly DocumentDatabase database;
 
         private readonly Dictionary<string, DocumentType> documentTypes = new Dictionary<string, DocumentType>(StringComparer.OrdinalIgnoreCase)
-                                                                          {
-                                                                              {Constants.RavenReplicationDestinations, DocumentType.ReplicationDestinations},
-                                                                              {Constants.Versioning.RavenVersioningDefaultConfiguration, DocumentType.VersioningConfiguration},
-                                                                              {PeriodicExportSetup.RavenDocumentKey, DocumentType.PeriodicExportConfiguration},
-                                                                              {Constants.DocsHardLimit, DocumentType.QuotasConfiguration},
-                                                                              {Constants.DocsSoftLimit, DocumentType.QuotasConfiguration},
-                                                                              {Constants.SizeHardLimitInKB, DocumentType.QuotasConfiguration},
-                                                                              {Constants.SizeSoftLimitInKB, DocumentType.QuotasConfiguration},
-                                                                              {Constants.PeriodicExport.AwsAccessKey, DocumentType.PeriodicExportSettingsConfiguration},
-                                                                              {Constants.PeriodicExport.AwsSecretKey, DocumentType.PeriodicExportSettingsConfiguration},
-                                                                              {Constants.PeriodicExport.AzureStorageAccount, DocumentType.PeriodicExportSettingsConfiguration},
-                                                                              {Constants.PeriodicExport.AzureStorageKey, DocumentType.PeriodicExportSettingsConfiguration},
-                                                                              {Constants.SqlReplication.SqlReplicationConnectionsDocumentName, DocumentType.SqlReplicationConnections},
-                                                                              {Constants.RavenJavascriptFunctions, DocumentType.JavascriptFunctions},
-                                                                              {Constants.RavenReplicationConfig, DocumentType.ReplicationConflictResolutionConfiguration}
-                                                                          };
+        {
+            {Constants.RavenReplicationDestinations, DocumentType.ReplicationDestinations},
+            {Constants.Versioning.RavenVersioningDefaultConfiguration, DocumentType.VersioningConfiguration},
+            {PeriodicExportSetup.RavenDocumentKey, DocumentType.PeriodicExportConfiguration},
+            {Constants.DocsHardLimit, DocumentType.QuotasConfiguration},
+            {Constants.DocsSoftLimit, DocumentType.QuotasConfiguration},
+            {Constants.SizeHardLimitInKB, DocumentType.QuotasConfiguration},
+            {Constants.SizeSoftLimitInKB, DocumentType.QuotasConfiguration},
+            {Constants.PeriodicExport.AwsAccessKey, DocumentType.PeriodicExportSettingsConfiguration},
+            {Constants.PeriodicExport.AwsSecretKey, DocumentType.PeriodicExportSettingsConfiguration},
+            {Constants.PeriodicExport.AzureStorageAccount, DocumentType.PeriodicExportSettingsConfiguration},
+            {Constants.PeriodicExport.AzureStorageKey, DocumentType.PeriodicExportSettingsConfiguration},
+            {Constants.SqlReplication.SqlReplicationConnectionsDocumentName, DocumentType.SqlReplicationConnections},
+            {Constants.RavenJavascriptFunctions, DocumentType.JavascriptFunctions},
+            {Constants.RavenReplicationConfig, DocumentType.ReplicationConflictResolutionConfiguration}
+        };
 
         private readonly ReplicationConflictResolutionConfigurationRetriever replicationConflictResolutionConfigurationRetriever;
 
@@ -54,6 +55,8 @@ namespace Raven.Database.Config.Retriever
         private readonly SqlReplicationConfigurationRetriever sqlReplicationConfigurationRetriever;
 
         private readonly JavascriptFunctionsRetriever javascriptFunctionsRetriever;
+
+        private readonly ConcurrentSet<Action<DocumentDatabase, DocumentChangeNotification, RavenJObject>> systemOnDocumentChangeNotifications = new ConcurrentSet<Action<DocumentDatabase, DocumentChangeNotification, RavenJObject>>();
 
         private static DateTime? licenseEnabled;
 
@@ -142,7 +145,10 @@ namespace Raven.Database.Config.Retriever
         {
             var globalKey = GetGlobalConfigurationDocumentKey(key);
 
-            systemDatabase.Notifications.OnDocumentChange += (documentDatabase, notification, metadata) => SendNotification(notification, globalKey, action);
+            Action<DocumentDatabase, DocumentChangeNotification, RavenJObject> systemNotification = (documentDatabase, notification, metadata) => SendNotification(notification, globalKey, action);
+            systemOnDocumentChangeNotifications.Add(systemNotification);
+            systemDatabase.Notifications.OnDocumentChange += systemNotification;
+
             database.Notifications.OnDocumentChange += (documentDatabase, notification, metadata) => SendNotification(notification, key, action);
         }
 
@@ -224,6 +230,14 @@ namespace Raven.Database.Config.Retriever
             JavascriptFunctions,
             PeriodicExportSettingsConfiguration,
             ReplicationConflictResolutionConfiguration
+        }
+
+        public void Dispose()
+        {
+            foreach (var systemNotification in systemOnDocumentChangeNotifications)
+                systemDatabase.Notifications.OnDocumentChange -= systemNotification;
+
+            systemOnDocumentChangeNotifications.Clear();
         }
     }
 }

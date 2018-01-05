@@ -75,7 +75,19 @@ namespace Raven.Database.FileSystem.Synchronization
                     case SynchronizationType.MetadataUpdate:
                         ExecuteMetadataUpdate();
                         break;
+                    case SynchronizationType.ContentUpdateNoRDC:
                     case SynchronizationType.ContentUpdate:
+
+                        if (type == SynchronizationType.ContentUpdateNoRDC)
+                        {
+                            using (fs.DisableAllTriggersForCurrentThread())
+                            {
+                                fs.Files.IndicateFileToDelete(fileName, null);
+                            }
+
+                            localMetadata = null;
+                        }
+
                         await ExecuteContentUpdate(localMetadata, report).ConfigureAwait(false);
                         
                         afterSynchronizationTriggerData = new
@@ -107,7 +119,7 @@ namespace Raven.Database.FileSystem.Synchronization
                 {
                     report.Exception = ex;
 
-                    Log.WarnException(string.Format("Error was occurred during deletion synchronization of file '{0}' from {1}", fileName, sourceFs), ex);
+                    Log.WarnException(string.Format("Error was occurred during {2} synchronization of file '{0}' from {1}", fileName, sourceFs, type), ex);
                 }
             }
 
@@ -262,7 +274,10 @@ namespace Raven.Database.FileSystem.Synchronization
                 currentEtag = accessor.ReadFile(fileName).Etag;
             });
 
-            fs.Files.ExecuteRenameOperation(new RenameFileOperation(fileName, rename, currentEtag, sourceMetadata.DropRenameMarkers()));
+            fs.Files.ExecuteRenameOperation(new RenameFileOperation(fileName, rename, currentEtag, sourceMetadata.DropRenameMarkers())
+            {
+                ForceExistingFileRemoval = true
+            });
         }
 
         private async Task ExecuteContentUpdate(RavenJObject localMetadata, SynchronizationReport report)

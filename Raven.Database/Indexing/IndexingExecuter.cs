@@ -41,7 +41,8 @@ namespace Raven.Database.Indexing
         {
             autoTuner = new IndexBatchSizeAutoTuner(context);
             this.prefetcher = prefetcher;
-            defaultPrefetchingBehavior = prefetcher.CreatePrefetchingBehavior(PrefetchingUser.Indexer, autoTuner, "Default Prefetching behavior", true);
+            defaultPrefetchingBehavior = prefetcher.CreatePrefetchingBehavior(PrefetchingUser.Indexer, 
+                autoTuner, "Default Prefetching behavior", isDefault: true, entityNames: null);
             defaultPrefetchingBehavior.ShouldHandleUnusedDocumentsAddedAfterCommit = true;
             prefetchingBehaviors.TryAdd(defaultPrefetchingBehavior);
         }
@@ -313,6 +314,7 @@ namespace Raven.Database.Indexing
             public void ReleaseIndexingGroupFinished()
             {
                 IndexingGroupProcessingFinished = null;
+                Indexes.Clear();
             }
 
             public void PrefetchDocuments()
@@ -320,10 +322,8 @@ namespace Raven.Database.Indexing
                 /*prefetchDisposable = new WeakReference<IDisposable>(
                     PrefetchingBehavior.DocumentBatchFrom(LastIndexedEtag, out JsonDocs));*/
 
-                var entityNamesToIndex = GetEntityNamesToIndex(Indexes, Context.Database);
-
                 prefetchDisposable =
-                    PrefetchingBehavior.DocumentBatchFrom(LastIndexedEtag, out JsonDocs, entityNamesToIndex);
+                    PrefetchingBehavior.DocumentBatchFrom(LastIndexedEtag, out JsonDocs);
             }
 
             ~IndexingGroup()
@@ -431,9 +431,15 @@ namespace Raven.Database.Indexing
         {
             var entityNamesToIndex = GetEntityNamesToIndex(groupIndex.Indexes, context.Database);
             groupIndex.PrefetchingBehavior = TryGetPrefetcherFor(groupIndex.LastIndexedEtag, usedPrefetchers, entityNamesToIndex) ??
-                                      TryGetDefaultPrefetcher(groupIndex.LastIndexedEtag, usedPrefetchers) ??
-                                      GetPrefetcherFor(groupIndex.LastIndexedEtag, usedPrefetchers);
+                                      TryGetDefaultPrefetcher(groupIndex.LastIndexedEtag, usedPrefetchers, entityNamesToIndex) ??
+                                      GetPrefetcherFor(groupIndex.LastIndexedEtag, usedPrefetchers, entityNamesToIndex);
 
+            if (groupIndex.PrefetchingBehavior.IsDefault == false)
+            {
+                // the default one is always for "all collections"
+                groupIndex.PrefetchingBehavior.SetEntityNames(entityNamesToIndex);
+            }
+            
             groupIndex.PrefetchingBehavior.Indexes = groupIndex.Indexes;
             groupIndex.PrefetchingBehavior.LastIndexedEtag = groupIndex.LastIndexedEtag;
         }
@@ -453,6 +459,38 @@ namespace Raven.Database.Indexing
             return null;
         }
 
+        private PrefetchingBehavior TryGetDefaultPrefetcher(Etag fromEtag,
+            ConcurrentSet<PrefetchingBehavior> usedPrefetchers, HashSet<string> entityNames)
+        {
+            if (defaultPrefetchingBehavior.CanUseDefaultPrefetcher(fromEtag, entityNames) &&
+                usedPrefetchers.TryAdd(defaultPrefetchingBehavior))
+            {
+                return defaultPrefetchingBehavior;
+            }
+
+            return null;
+        }
+
+        private PrefetchingBehavior GetPrefetcherFor(Etag fromEtag,
+            ConcurrentSet<PrefetchingBehavior> usedPrefetchers, HashSet<string> entityNames)
+        {
+            foreach (var prefetchingBehavior in prefetchingBehaviors)
+            {
+                // at this point we've already verified that we can't use the default prefetcher
+                // even if the deafult is empty, we don't need to use it
+                if (prefetchingBehavior.IsDefault == false && prefetchingBehavior.IsEmpty() && usedPrefetchers.TryAdd(prefetchingBehavior))
+                    return prefetchingBehavior;
+            }
+
+            var newPrefetcher = prefetcher.CreatePrefetchingBehavior(PrefetchingUser.Indexer,
+                autoTuner, $"Etags from: {fromEtag}", entityNames: entityNames);
+
+            prefetchingBehaviors.Add(newPrefetcher);
+            usedPrefetchers.Add(newPrefetcher);
+
+            return newPrefetcher;
+        }
+
         private void ReleasePrefetchersAndUpdateStatistics(IndexingGroup indexingGroup, TimeSpan elapsedTimeSpan)
         {
             if (indexingGroup.JsonDocs != null && indexingGroup.JsonDocs.Count > 0)
@@ -466,17 +504,6 @@ namespace Raven.Database.Indexing
             indexingGroup.ReleaseIndexingGroupFinished();
         }
 
-        private PrefetchingBehavior TryGetDefaultPrefetcher(Etag fromEtag, ConcurrentSet<PrefetchingBehavior> usedPrefetchers)
-        {
-            if (defaultPrefetchingBehavior.CanUseDefaultPrefetcher(fromEtag) &&
-                usedPrefetchers.TryAdd(defaultPrefetchingBehavior))
-            {
-                return defaultPrefetchingBehavior;
-            }
-
-            return null;
-        }
-
         private bool PerformIndexingOnIndexBatches(ConcurrentDictionary<IndexingBatchOperation, object> indexBatchOperations)
         {
             var operationWasCancelled = false;
@@ -488,7 +515,8 @@ namespace Raven.Database.Indexing
                 if (context.Database.ThreadPool == null || context.RunIndexing==false)
                     throw new OperationCanceledException();
 
-                context.Database.ThreadPool.ExecuteBatch(indexBatchOperations.Keys.ToList(),
+                var ranToCompletion = 
+                    context.Database.ThreadPool.ExecuteBatch(indexBatchOperations.Keys.ToList(),
                     indexBatchOperation =>
                     {
                         context.CancellationToken.ThrowIfCancellationRequested();
@@ -498,11 +526,15 @@ namespace Raven.Database.Indexing
 
                             if (performance != null)
                                 indexBatchOperation.IndexingBatchInfo.PerformanceStats.TryAdd(indexBatchOperation.IndexingBatch.Index.PublicName, performance);
-
-                            context.NotifyAboutWork();
+                            
                         }
-                    }, allowPartialBatchResumption: MemoryStatistics.AvailableMemoryInMb > 1.5*context.Configuration.MemoryLimitForProcessingInMb,
-                    description: $"Performing indexing on index batches for a total of {indexBatchOperations.Count} indexes", database:context.Database);
+                    }, allowPartialBatchResumption:  MemoryStatistics.AvailableMemoryInMb > 1.5*context.Configuration.MemoryLimitForProcessingInMb,
+                    description: $"Performing indexing on index batches for a total of {indexBatchOperations.Count} indexes", database:context.Database, runAfterCompletion:context.NotifyAboutWork);
+
+                if (ranToCompletion == false)
+                {
+                    context.NotifyAboutWork();
+                }
             }
             catch (OperationCanceledException)
             {
@@ -518,7 +550,8 @@ namespace Raven.Database.Indexing
             return operationWasCancelled;
         }
 
-        private bool GenerateIndexingBatchesAndPrefetchDocuments(List<IndexingGroup> groupedIndexes, ConcurrentDictionary<IndexingBatchOperation, object> indexBatchOperations)
+        private bool GenerateIndexingBatchesAndPrefetchDocuments(List<IndexingGroup> groupedIndexes, 
+            ConcurrentDictionary<IndexingBatchOperation, object> indexBatchOperations)
         {
             bool operationWasCancelled = false;
 
@@ -643,24 +676,6 @@ namespace Raven.Database.Indexing
             }
             indexingGroups = indexingGroups.OrderByDescending(x => x.LastQueryTime).ToList();
             return false;
-        }
-
-        private PrefetchingBehavior GetPrefetcherFor(Etag fromEtag, ConcurrentSet<PrefetchingBehavior> usedPrefetchers)
-        {
-            foreach (var prefetchingBehavior in prefetchingBehaviors)
-            {
-                // at this point we've already verified that we can't use the default prefetcher
-                // if it's empty, we don't need to use it
-                if (prefetchingBehavior.IsDefault == false && prefetchingBehavior.IsEmpty() && usedPrefetchers.TryAdd(prefetchingBehavior))
-                    return prefetchingBehavior;
-            }
-
-            var newPrefetcher = prefetcher.CreatePrefetchingBehavior(PrefetchingUser.Indexer, autoTuner, string.Format("Etags from: {0}", fromEtag));
-
-            prefetchingBehaviors.Add(newPrefetcher);
-            usedPrefetchers.Add(newPrefetcher);
-
-            return newPrefetcher;
         }
 
         private void RemoveUnusedPrefetchers(IEnumerable<PrefetchingBehavior> usedPrefetchingBehaviors)
@@ -883,64 +898,75 @@ namespace Raven.Database.Indexing
                     }
 
                     var keepTrying = true;
-                    for (var i = 0; i < 10 && keepTrying; i++)
+                    //Here we make sure that the database isn't been disposed so we won't advance the indexing etags on 
+                    //aborted batches (see RavenDB-5603 related changes)
+                    if (context.Database.Disposed == false)
                     {
-                        keepTrying = false;
-
-                        try
+                        for (var i = 0; i < 10 && keepTrying; i++)
                         {
-                            transactionalStorage.Batch(actions =>
-                            {
-                                // whatever we succeeded in indexing or not, we have to update this
-                                // because otherwise we keep trying to re-index failed documents
-                                actions.Indexing.UpdateLastIndexed(batchForIndex.IndexId, lastEtag, lastModified);
+                            keepTrying = false;
 
-                                // if we are saving the last indexed etag
-                                // we need to make sure that the last index etag is flushed to disk
-                                // otherwise we are going to reset the index etag to the last commited one on restart 
-                                // (if we discover that the last indexed etag is different from the last commited one)
-                                // we already flush the last indexed etag when we pass a certain size in ram,
-                                // however we don't do that if we only have a few of them
-                                // it's also limited to flushing for every 10 minutes if don't have any results
-                                actions.BeforeStorageCommit += () =>
+                            try
+                            {
+                                transactionalStorage.Batch(actions =>
                                 {
-                                    batchForIndex.Index.EnsureIndexWriter(useWriteLock: true);
-                                    // we don't to flush to disk too often
-                                    batchForIndex.Index.Flush(lastEtag, considerLastCommitedTime: true);
-                                };
-                            });
-                        }
-                        catch (IndexDoesNotExistsException)
-                        {
-                            //we can ignore this, no need to retry
-                        }
-                        catch (Exception e)
-                        {
-                            if (TransactionalStorageHelper.IsOutOfMemoryException(e))
+                                    // whatever we succeeded in indexing or not, we have to update this
+                                    // because otherwise we keep trying to re-index failed documents
+                                    actions.Indexing.UpdateLastIndexed(batchForIndex.IndexId, lastEtag, lastModified);
+
+                                    // if we are saving the last indexed etag
+                                    // we need to make sure that the last index etag is flushed to disk
+                                    // otherwise we are going to reset the index etag to the last commited one on restart 
+                                    // (if we discover that the last indexed etag is different from the last commited one)
+                                    // we already flush the last indexed etag when we pass a certain size in ram,
+                                    // however we don't do that if we only have a few of them
+                                    // it's also limited to flushing for every 10 minutes if we don't have any results
+                                    actions.BeforeStorageCommit += () =>
+                                    {
+                                        batchForIndex.Index.EnsureIndexWriter();
+                                        // we don't want to flush to disk too often
+                                        batchForIndex.Index.Flush(lastEtag, considerLastCommitedTime: true);
+                                    };
+                                });
+                            }
+                            catch (IndexDoesNotExistsException)
                             {
-                                batchForIndex.Index.AddOutOfMemoryDatabaseAlert(e);
-                                //if it's an esent/voron OOME we can keep trying
-                                keepTrying = true;
+                                // we can ignore this, no need to retry
+                                break;
+                            }
+                            catch (ObjectDisposedException)
+                            {
+                                // the index was disposed during database shutdown
+                                break;
+                            }
+                            catch (Exception e)
+                            {
+                                if (TransactionalStorageHelper.IsOutOfMemoryException(e))
+                                {
+                                    batchForIndex.Index.AddOutOfMemoryDatabaseAlert(e);
+                                    //if it's an esent/voron OOME we can keep trying
+                                    keepTrying = true;
+                                }
+
+                                Exception conflictException;
+                                if (TransactionalStorageHelper.IsWriteConflict(e, out conflictException))
+                                {
+                                    Log.Info($"Write conflict encountered for index '{batchForIndex.Index.PublicName}' when updating last etag. " +
+                                             $"Will retry. Details: {conflictException.Message}");
+                                    keepTrying = true;
+                                }
+
+                                if (keepTrying == false)
+                                {
+                                    //unknown error
+                                    Log.WarnException($"Failed to update last etag for index '{batchForIndex.Index.PublicName}'", e);
+                                    context.AddError(batchForIndex.IndexId, batchForIndex.Index.PublicName, null, e);
+                                }
                             }
 
-                            Exception conflictException;
-                            if (TransactionalStorageHelper.IsWriteConflict(e, out conflictException))
-                            {
-                                Log.Info($"Write conflict encountered for index '{batchForIndex.Index.PublicName}' when updating last etag. " +
-                                         $"Will retry. Details: {conflictException.Message}");
-                                keepTrying = true;
-                            }
-
-                            if (keepTrying == false)
-                            {
-                                //unknown error
-                                Log.WarnException($"Failed to update last etag for index '{batchForIndex.Index.PublicName}'", e);
-                                context.AddError(batchForIndex.IndexId, batchForIndex.Index.PublicName, null, e);
-                            }
+                            if (keepTrying)
+                                Thread.Sleep(11);
                         }
-
-                        if (keepTrying)
-                            Thread.Sleep(11);
                     }
                 }
             }
@@ -1029,15 +1055,23 @@ namespace Raven.Database.Indexing
                         var doc = filteredDoc.Doc;
                         var json = filteredDoc.Json;
 
-                        if (defaultPrefetchingBehavior.FilterDocuments(doc) == false
-                            || doc.Etag.CompareTo(indexToWorkOn.LastIndexedEtag) <= 0)
-                            continue;
-
-                        // did we already indexed this document in this index?
-
                         var etag = doc.Etag;
                         if (etag == null)
                             continue;
+
+                        // did we already indexed this document in this index?
+                        if (defaultPrefetchingBehavior.FilterDocuments(doc) == false
+                            || etag.CompareTo(indexToWorkOn.LastIndexedEtag) <= 0)
+                        {
+                            if (Log.IsDebugEnabled)
+                            {
+                                var skipReason = defaultPrefetchingBehavior.FilterDocuments(doc) == false ?
+                                    "document was deleted" : 
+                                    $"document was already indexed (etag: {doc.Etag}, last indexed: {indexToWorkOn.LastIndexedEtag})";
+                                Log.Debug($"Skipping indexing of document {doc.Key}, Reason: {skipReason}");
+                            }
+                            continue;
+                        }
 
                         // is the Raven-Entity-Name a match for the things the index executes on?
                         if (viewGenerator.ForEntityNames.Count != 0 &&
@@ -1069,7 +1103,7 @@ namespace Raven.Database.Indexing
                                 accessor.Indexing.UpdateLastIndexed(indexToWorkOn.Index.indexId, lastEtag, lastModified);
                                 accessor.BeforeStorageCommit += () =>
                                 {
-                                    indexToWorkOn.Index.EnsureIndexWriter(useWriteLock: true);
+                                    indexToWorkOn.Index.EnsureIndexWriter();
                                     indexToWorkOn.Index.Flush(lastEtag);
                                 };
                             }, indexToWorkOn));
@@ -1122,6 +1156,7 @@ namespace Raven.Database.Indexing
                     catch (IndexDoesNotExistsException)
                     {
                         // we can ignore this, no need to retry
+                        break;
                     }
                     catch (ObjectDisposedException)
                     {

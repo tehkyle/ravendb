@@ -48,7 +48,7 @@ namespace Rachis.Behaviors
             var vetoResult = Engine.CheckIfThereIsVetoOnBecomingCandidate();
             if (vetoResult.VetoCandidacy)
             {
-                _log.Info("Got timeouf in follower mode in term {0}, but had a veto on becoming a candidate, reason: {1} ",
+                _log.Info("Got timeout in follower mode in term {0}, but had a veto on becoming a candidate, reason: {1} ",
                     Engine.PersistentState.CurrentTerm, 
                     vetoResult.Reason);
                 return;
@@ -56,6 +56,13 @@ namespace Rachis.Behaviors
             _log.Info("Got timeout in follower mode in term {0}", Engine.PersistentState.CurrentTerm);
 
             Engine.SetState(RaftEngineState.Candidate);
+        }
+
+        public override void Dispose()
+        {
+            if (_log.IsDebugEnabled)
+                _log.Debug("Disposing of FollowerStateBehavior");
+            base.Dispose();
         }
     }
 }

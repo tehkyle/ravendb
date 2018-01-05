@@ -30,6 +30,7 @@ namespace Rachis
         private readonly RaftEngineOptions _raftEngineOptions;
         private readonly CancellationTokenSource _eventLoopCancellationTokenSource;
         private readonly ManualResetEventSlim _leaderSelectedEvent = new ManualResetEventSlim();
+        private readonly ManualResetEventSlim _leaderConfirmedEvent = new ManualResetEventSlim();
         private TaskCompletionSource<object> _steppingDownCompletionSource;
 
         private Topology _currentTopology;
@@ -54,12 +55,15 @@ namespace Rachis
                 if (_currentLeader == value)
                     return;
                 if (_log.IsDebugEnabled)
-                    _log.Debug("Setting CurrentLeader: {0}", value);
+                    _log.Debug("Setting CurrentLeader: {0} on term {1}", value, PersistentState.CurrentTerm);
                 _currentLeader = value;
 
 
                 if (value == null)
+                {
                     _leaderSelectedEvent.Reset();
+                    _leaderConfirmedEvent.Reset();
+                }
                 else
                 {
                     _leaderSelectedEvent.Set();
@@ -67,12 +71,7 @@ namespace Rachis
             }
         }
 
-    
-        public long CommitIndex
-        {
-            get { return StateMachine.LastAppliedIndex; }
-            
-        }
+        public long CommitIndex => StateMachine.LastAppliedIndex;
 
         public RaftEngineState State
         {
@@ -101,9 +100,8 @@ namespace Rachis
             return candidacyResult;
         }
 
-        private readonly Task _eventLoopTask;
+        private Task _eventLoopTask;
 
-        private long _commitIndex;
         private string _currentLeader;
 
         private Task _snapshottingTask;
@@ -121,8 +119,7 @@ namespace Rachis
         public event Action StateTimeout;
         public event Action<LogEntry[]> EntriesAppended;
         public event Action<long, long> CommitIndexChanged;
-        public event Action ElectedAsLeader;
-
+        public event Action ElectedAsLeader;        
         public event Action<TopologyChangeCommand> TopologyChanged;
         public event Action TopologyChanging;
 
@@ -170,8 +167,7 @@ namespace Rachis
             {
                 SetState(RaftEngineState.Follower);
             }
-
-            _commitIndex = StateMachine.LastAppliedIndex;            
+        
             _eventLoopTask = Task.Factory.StartNew(EventLoop, TaskCreationOptions.LongRunning);
         }
 
@@ -195,9 +191,9 @@ namespace Rachis
                     //Append entries is a very common messgae (it is the heartbeat)
                     //We don't want to keep empty append entries in the log so we filter them.
                     AppendEntriesRequestWithEntries appendEntriesRequest;
-                    if (messageBase != null && ShouldNotFilterMessage(messageBase,out appendEntriesRequest))
+                    if (messageBase != null && ShouldNotFilterMessage(messageBase, out appendEntriesRequest))
                         EngineStatistics.Messages.LimitedSizeEnqueue(
-                            new MessageWithTimingInformation {Message = appendEntriesRequest??messageBase, MessageReceiveTime = DateTime.UtcNow},
+                            new MessageWithTimingInformation {Message = appendEntriesRequest ?? messageBase, MessageReceiveTime = DateTime.UtcNow},
                             RaftEngineStatistics.NumberOfMessagesToTrack);
                     if (_eventLoopCancellationTokenSource.IsCancellationRequested)
                     {
@@ -205,9 +201,18 @@ namespace Rachis
                             _log.Debug("Cancellation request from event loop");
                         break;
                     }
-
+                    //The behavior may have changed while we were waiting for messages (this happens when forcing leadership).
+                    var hasStateChagned = behavior != StateBehavior;
+                    var oldBehavior = behavior;
+                    behavior = StateBehavior;
                     if (hasMessage == false)
                     {
+                        if (hasStateChagned)
+                        {
+                            if (_log.IsDebugEnabled)
+                                _log.Debug("State {0} timeout but the behavior has changed to {2} so we will skip timeout handling ({1:#,#;;0} ms).", oldBehavior.State, oldBehavior.Timeout, behavior.State);
+                            continue;
+                        }
                         if (State != RaftEngineState.Leader && _log.IsDebugEnabled)
                             _log.Debug("State {0} timeout ({1:#,#;;0} ms).", State, behavior.Timeout);
                         EngineStatistics.TimeOuts.LimitedSizeEnqueue(
@@ -230,6 +235,15 @@ namespace Rachis
                 catch (OperationCanceledException)
                 {
                     break;
+                }
+                catch (Exception e)
+                {
+                    //This is unexpected and we can't have our event loop die on us so we re-create it 
+                    _log.ErrorException($"Unexpected exception thrown from event loop",e);
+                    _eventLoopTask.ContinueWith(_ =>
+                    {
+                        _eventLoopTask = Task.Factory.StartNew(EventLoop, TaskCreationOptions.LongRunning);
+                    }, CancellationToken);
                 }
             }
         }
@@ -311,7 +325,7 @@ namespace Rachis
             Debug.Assert(StateBehavior != null, "StateBehavior != null");
             OnStateChanged(state);
             if (_log.IsDebugEnabled)
-                _log.Debug("{0} ==> {1}", oldState, state);
+                _log.Debug("{2}:{0} ==> {1}", oldState, state,this.Options.SelfConnection.Uri);
         }
 
 
@@ -382,6 +396,9 @@ namespace Rachis
 
         public Task UpdateNodeAsync(NodeConnectionInfo node)
         {
+            if (CurrentLeader == node.Name && node.IsNoneVoter)
+                throw new InvalidOperationException("Can't change leader voting mode to none voter");
+
             var currentTopology = CurrentTopology;
 
             var allVotingNodes = currentTopology.AllVotingNodes.Select(n => n.Uri.AbsoluteUri == node.Uri.AbsoluteUri ? node : n).ToList();
@@ -481,11 +498,9 @@ namespace Rachis
             }
         }
 
-        public Topology CurrentTopology
-        {
-            get { return _currentTopology; }
-        }
+        public Topology CurrentTopology => _currentTopology;
 
+        public Topology PersistentStateCurrentTopology => PersistentState.GetCurrentTopology();
 
         internal bool LogIsUpToDate(long lastLogTerm, long lastLogIndex)
         {
@@ -499,7 +514,15 @@ namespace Rachis
 
         public bool WaitForLeader(int timeout = 10*1000)
         {
-            return _leaderSelectedEvent.Wait(timeout, CancellationToken);
+            var leaderFound = _leaderSelectedEvent.Wait(timeout, CancellationToken);
+            if (leaderFound == false)
+                CurrentLeader = null;
+            return leaderFound;
+        }
+
+        public bool WaitForLeaderConfirmed(int timeout = 10 * 1000)
+        {
+            return _leaderConfirmedEvent.Wait(timeout, CancellationToken);
         }
 
         public void AppendCommand(Command command)
@@ -509,13 +532,13 @@ namespace Rachis
             var leaderStateBehavior = StateBehavior as LeaderStateBehavior;
             if (leaderStateBehavior == null || leaderStateBehavior.State != RaftEngineState.Leader)
                 throw new NotLeadingException("Command can be appended only on leader node. This node behavior type is " +
-                                                    StateBehavior.GetType().Name)
+                                              StateBehavior.GetType().Name)
                 {
                     CurrentLeader = CurrentLeader
                 };
+        
 
-
-            leaderStateBehavior.AppendCommand(command);
+        leaderStateBehavior.AppendCommand(command);
         }
 
         public void ApplyCommits(long from, long to)
@@ -546,7 +569,15 @@ namespace Rachis
                         // StartTopologyChange(tcc); - not sure why it was needed, see RavenDB-3808 for details
                         CommitTopologyChange(tcc);
                     }
-
+                    var noop = command as NopCommand;
+                    if (noop != null && entry.Term == PersistentState.CurrentTerm)
+                    {
+                        if (_log.IsInfoEnabled)
+                        {
+                            _log.Info($"Raising leaderConfirmedEvent, Term = {entry.Term}, Index = {entry.Index}, Name = {Name}");
+                        }
+                        _leaderConfirmedEvent.Set();
+                    }
                     OnCommitIndexChanged(oldCommitIndex, CommitIndex);
                     OnCommitApplied(command);
                 }
@@ -970,6 +1001,25 @@ namespace Rachis
             steppingDownCompletionSource.TrySetResult(null);
         }
 
+        public FollowerLastSentEntries GetFollowerStatistics()
+        {
+            var leader = StateBehavior as LeaderStateBehavior;
+            return leader?.GetMaxIndexOnQuorumInternal();
+        }
+
+        public void Danger__CutLogAtPosition(long postion)
+        {
+            PersistentState.AppendToLog(this, new List<LogEntry>(), postion);
+            if (postion < StateMachine.LastAppliedIndex)
+            {
+                StateMachine.Danger__SetLastApplied(postion);
+            }
+        }
+
+        public ILog GetLogger()
+        {
+            return _log;
+        }
     }
 
     public class ProposingCandidacyResult : EventArgs

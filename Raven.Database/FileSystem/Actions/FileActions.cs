@@ -266,13 +266,20 @@ namespace Raven.Database.FileSystem.Actions
 
                 Publisher.Publish(new FileChangeNotification { File = operation.Name, Action = FileChangeAction.Renaming });
 
-                var previousRenameTombstone = accessor.ReadFile(operation.Rename);
+                var renameFile = accessor.ReadFile(operation.Rename);
 
-                if (previousRenameTombstone != null &&
-                    previousRenameTombstone.Metadata[SynchronizationConstants.RavenDeleteMarker] != null)
+                if (renameFile != null)
                 {
-                    // if there is a tombstone delete it
-                    accessor.Delete(previousRenameTombstone.FullPath);
+                    if (renameFile.Metadata[SynchronizationConstants.RavenDeleteMarker] != null)
+                    {
+                        // if there is a tombstone delete it
+                        accessor.Delete(renameFile.FullPath);
+                    }
+                    else if (operation.ForceExistingFileRemoval)
+                    {
+                        // used by synchronization
+                        accessor.Delete(renameFile.FullPath);
+                    }
                 }
 
                 FileSystem.RenameTriggers.Apply(trigger => trigger.OnRename(operation.Name, operation.MetadataAfterOperation));
@@ -285,12 +292,15 @@ namespace Raven.Database.FileSystem.Actions
                 // copy renaming file metadata and set special markers
                 var tombstoneMetadata = new RavenJObject(operation.MetadataAfterOperation).WithRenameMarkers(operation.Rename);
 
-                var putResult = accessor.PutFile(operation.Name, 0, tombstoneMetadata, true); // put rename tombstone
+                accessor.PutFile(operation.Name, 0, tombstoneMetadata, true); // put rename tombstone
+
+                // let's bump renamed doc etag so it'll be greater than tombstone
+                var touchResult = accessor.TouchFile(operation.Rename, null);
 
                 accessor.DeleteConfig(configName);
 
                 Search.Delete(operation.Name);
-                Search.Index(operation.Rename, operation.MetadataAfterOperation, putResult.Etag);
+                Search.Index(operation.Rename, operation.MetadataAfterOperation, touchResult.Etag);
             });
 
             Publisher.Publish(new ConfigurationChangeNotification { Name = configName, Action = ConfigurationChangeAction.Set });
@@ -299,7 +309,7 @@ namespace Raven.Database.FileSystem.Actions
 
         public void ExecuteCopyOperation(CopyFileOperation operation)
         {
-            var configName = RavenFileNameHelper.CopyOperationConfigNameForFile(operation.SourceFilename);
+            var configName = RavenFileNameHelper.CopyOperationConfigNameForFile(operation.SourceFilename, operation.TargetFilename);
 
             Storage.Batch(accessor =>
             {

@@ -11,7 +11,7 @@ Digit      [0-9]
 Number     [+-]?{Digit}+
 Decimal    [+-]?{Number}\.{Number}
 EscapeChar \\[^]
-TermStartChar [^ :\t\r\n\f\+\-!\{\}()"^\*\?\\~\[\],]|{EscapeChar}
+TermStartChar [^ :\t\r\n\f\+\-!\{\}()"^\*\?\\~\[\]]|{EscapeChar}
 TermChar {TermStartChar}|[,\-\+]
 WildCardStartChar {TermStartChar}|[\*\?]
 WildCardChar [\*\?]|{TermChar}
@@ -23,7 +23,7 @@ QuotedTerm \"{QuotedChar}*\"
 UnquotedTerm {TermStartChar}{TermChar}*
 PrefixTerm {UnquotedTerm}"\*"
 WildCardTerm  {WildCardStartChar}{WildCardChar}*
-Method \@[^<]+\<[^>]+\>
+Method \@{TermStartChar}[^<]*\<{TermStartChar}[^>]*\>
 DateTime {Digit}{4}-{Digit}{2}-{Digit}{2}T{Digit}{2}\:{Digit}{2}\:{Digit}{2}\.{Digit}{7}Z?
 
 
@@ -32,7 +32,6 @@ DateTime {Digit}{4}-{Digit}{2}-{Digit}{2}T{Digit}{2}\:{Digit}{2}\:{Digit}{2}\.{D
 %}
 
 %%
-","								{return (int)Token.COMMA;}
 "^"								{return (int)Token.BOOST;}
 "~"								{return (int)Token.TILDA;}
 "{"								{return (int)Token.OPEN_CURLY_BRACKET;}
@@ -45,6 +44,7 @@ DateTime {Digit}{4}-{Digit}{2}-{Digit}{2}T{Digit}{2}\:{Digit}{2}\:{Digit}{2}\.{D
 "AND"							{return (int)Token.AND;}
 "&&"							{return (int)Token.AND;}
 "NOT"							{return (int)Token.NOT;}
+"!"		 					    {return (int)Token.NOT;}
 "+"								{return (int)Token.PLUS;}
 "-"								{return (int)Token.MINUS;}
 "\""							{return (int)Token.QUOTE;}
@@ -70,16 +70,9 @@ DateTime {Digit}{4}-{Digit}{2}-{Digit}{2}T{Digit}{2}\:{Digit}{2}\:{Digit}{2}\.{D
 "Ix"{Number}					{ yylval.s = yytext; return (int)Token.INT_NUMBER;}
 "Lx"{Number}					{ yylval.s = yytext; return (int)Token.LONG_NUMBER;}
 "0x"{Number}					{ yylval.s = yytext; return (int)Token.HEX_NUMBER;}
-{UnquotedTerm}					{ 					
-								if(InMethod && bStack.Count == 0) 
-								{
-									yylval.s = HandleTermInMethod();
-								}
-								else 
-								{
-									yylval.s = DiscardEscapeChar(yytext, true);
-								}
-								return (int)Token.UNQUOTED_TERM;
+{UnquotedTerm}					{ 													
+                                    yylval.s = DiscardEscapeChar(yytext);
+								    return (int)Token.UNQUOTED_TERM;
 								}
 {PrefixTerm}					{ yylval.s = DiscardEscapeChar(yytext);  return (int)Token.PREFIX_TERM;}
 {WildCardTerm}					{ yylval.s = DiscardEscapeChar(yytext);  return (int)Token.WILDCARD_TERM;}

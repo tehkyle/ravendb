@@ -1,9 +1,7 @@
 using Sparrow;
 using System;
-using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Threading;
-using System.Threading.Tasks;
 using Voron.Impl.Paging;
 using Voron.Util;
 
@@ -44,22 +42,29 @@ namespace Voron.Impl.Journal
                 _locker.ExitReadLock();
             }		
         }
-
+        
         public bool Read(long pageNumber, byte* buffer, int count)
         {
             long pos = 0;
+
             foreach (var current in _buffers)
             {
-                if (pos != pageNumber)
+                if (pos < pageNumber)
                 {
                     pos += current.SizeInPages;
-                    
                     continue;
                 }
 
-                Memory.Copy(buffer, current.Pointer, count);
-                return true;
+                var toRead = Math.Min(count, (int)current.SizeInPages * AbstractPager.PageSize);
+
+                Memory.Copy(buffer, current.Pointer, toRead);
+
+                count -= toRead;
+
+                if (count == 0)
+                    return true;
             }
+
             return false;
         }
 

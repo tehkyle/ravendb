@@ -224,6 +224,24 @@ namespace Raven.Client
         }
 
         /// <summary>
+        /// LazilyAsync Query the facets results for this query using the specified facet document with the given start and pageSize
+        /// </summary>
+        /// <param name="facets">List of facets</param>
+        /// <param name="start">Start index for paging</param>
+        /// <param name="pageSize">Paging PageSize. If set, overrides Facet.MaxResults</param>
+        /// <param name="queryable">The queryable interface for the function to be applied to</param>
+        public static Lazy<Task<FacetResults>> ToFacetsLazyAsync<T>(this IQueryable<T> queryable, IEnumerable<Facet> facets, int start = 0, int? pageSize = null)
+        {
+            var ravenQueryInspector = ((IRavenQueryInspector)queryable);
+            var query = ravenQueryInspector.GetIndexQuery(true);
+
+            var lazyOperation = new LazyFacetsOperation(ravenQueryInspector.AsyncIndexQueried, facets.ToList(), query, start, pageSize);
+
+            var documentSession = ((AsyncDocumentSession)ravenQueryInspector.Session);
+            return documentSession.AddLazyOperation<FacetResults>(lazyOperation, null);
+        }
+
+        /// <summary>
         /// Lazily Query the facets results for this query using the specified list of facets with the given start and pageSize
         /// </summary>
         public static Lazy<FacetResults> ToFacetsLazy<T>(this IQueryable<T> queryable, IEnumerable<Facet> facets, int start = 0, int? pageSize = null)
@@ -427,6 +445,28 @@ namespace Raven.Client
             var lazyOperation = new LazySuggestOperation(ravenQueryInspector.IndexQueried, query);
 
             var documentSession = ((DocumentSession)ravenQueryInspector.Session);
+            return documentSession.AddLazyOperation<SuggestionQueryResult>(lazyOperation, null);
+        }
+
+        /// <summary>
+        /// LazyAsync Suggest alternative values for the queried term
+        /// </summary>
+        public static Lazy<Task<SuggestionQueryResult>> SuggestLazyAsync(this IQueryable queryable)
+        {
+            return SuggestLazyAsync(queryable, new SuggestionQuery());
+        }
+
+        /// <summary>
+        /// LazyAsync Suggest alternative values for the queried term
+        /// </summary>
+        public static Lazy<Task<SuggestionQueryResult>> SuggestLazyAsync(this IQueryable queryable, SuggestionQuery query)
+        {
+            var ravenQueryInspector = ((IRavenQueryInspector)queryable);
+            SetSuggestionQueryFieldAndTerm(ravenQueryInspector, query, true);
+
+            var lazyOperation = new LazySuggestOperation(ravenQueryInspector.AsyncIndexQueried, query);
+
+            var documentSession = ((AsyncDocumentSession)ravenQueryInspector.Session);
             return documentSession.AddLazyOperation<SuggestionQueryResult>(lazyOperation, null);
         }
 

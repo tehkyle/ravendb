@@ -27,7 +27,8 @@ namespace Voron.Impl.Scratch
         private const int InvalidScratchFileNumber = -1;
 
         // Immutable state. 
-        private readonly long _sizeLimit;
+        private readonly long sizeLimit;
+        private readonly long sizePerScratchLimit;
         private readonly StorageEnvironmentOptions _options;
         
         // Local per scratch file potentially read delayed inconsistent (need guards). All must be modified atomically (but it wont necessarily require a memory barrier)
@@ -36,12 +37,14 @@ namespace Voron.Impl.Scratch
 
         // Local writable state. Can perform multiple reads, but must never do multiple writes simultaneously.
         private int _currentScratchNumber = -1;
+        private DateTime lastScratchBuffersCleanup = DateTime.MinValue;
         private readonly ConcurrentDictionary<int, ScratchBufferItem> _scratchBuffers = new ConcurrentDictionary<int, ScratchBufferItem>(NumericEqualityComparer.Instance);
 
         public ScratchBufferPool(StorageEnvironment env)
         {
             _options = env.Options;
-            _sizeLimit = env.Options.MaxScratchBufferSize;
+            sizeLimit = env.Options.MaxScratchBufferSize;
+            sizePerScratchLimit = env.Options.MaxSizePerScratchBufferFile;
             _current = NextFile();
         }
 
@@ -90,48 +93,17 @@ namespace Voron.Impl.Scratch
 
             var current = _current;
             var currentFile = current.File;
+            var oldestActiveTransaction = tx.Environment.PossibleOldestReadTransaction;
             if (currentFile.TryGettingFromAllocatedBuffer(tx, numberOfPages, size, out result))
+            {
+                TryDeletingInactiveScratchBuffers(current, oldestActiveTransaction, ignoreLastCleanup: false);
                 return result;
-
-            long sizeAfterAllocation;
-            long oldestActiveTransaction = tx.Environment.OldestTransaction;
-
-            if (_scratchBuffers.Count == 1)
-            {
-                sizeAfterAllocation = currentFile.SizeAfterAllocation(size);
-            }
-            else
-            {
-                sizeAfterAllocation = size * AbstractPager.PageSize;
-
-                var scratchesToDelete = new List<int>();
-
-                // determine how many bytes of older scratches are still in use (at least when this snapshot is taken)
-                foreach (var scratch in _scratchBuffers.Values)
-                {
-                    var bytesInUse = scratch.File.ActivelyUsedBytes(oldestActiveTransaction);
-
-                    if (bytesInUse > 0)
-                        sizeAfterAllocation += bytesInUse;
-                    else
-                    {
-                        if(scratch != current)
-                            scratchesToDelete.Add(scratch.Number);
-                    }
-                }
-
-                // delete inactive scratches
-                foreach (var scratchNumber in scratchesToDelete)
-                {
-                    ScratchBufferItem scratchBufferToRemove;
-                    if ( _scratchBuffers.TryRemove(scratchNumber, out scratchBufferToRemove) )
-                    {
-                        scratchBufferToRemove.File.Dispose();
-                    }					
-                }
             }
 
-            if (sizeAfterAllocation >= (_sizeLimit*3)/4 && oldestActiveTransaction > current.OldestTransactionWhenFlushWasForced)
+            TryDeletingInactiveScratchBuffers(current, oldestActiveTransaction, ignoreLastCleanup: true);
+
+            var sizeAfterAllocation = GetTotalActivelyUsedBytes(size * AbstractPager.PageSize, oldestActiveTransaction);
+            if (sizeAfterAllocation >= (sizeLimit*3)/4 && oldestActiveTransaction > current.OldestTransactionWhenFlushWasForced)
             {
                 // we may get recursive flushing, so we want to avoid it
                 if (tx.Environment.Journal.Applicator.IsCurrentThreadInFlushOperation == false)
@@ -163,7 +135,13 @@ namespace Voron.Impl.Scratch
                 }
             }
 
-            if (sizeAfterAllocation > _sizeLimit)
+            if (currentFile.Size > sizePerScratchLimit)
+            {
+                // limit every scratch file size
+                return CreateNextFile(tx, numberOfPages, size);
+            }
+
+            if (sizeAfterAllocation > sizeLimit)
             {
                 var sp = Stopwatch.StartNew();
 
@@ -178,46 +156,31 @@ namespace Voron.Impl.Scratch
                 {
                     if (currentFile.TryGettingFromAllocatedBuffer(tx, numberOfPages, size, out result))
                         return result;
+
                     Thread.Sleep(32);
                 }
 
                 sp.Stop();
 
-                bool createNextFile = false;
+                var createNextFile = false;
+                sizeAfterAllocation = GetTotalActivelyUsedBytes(size * AbstractPager.PageSize, tx.Environment.PossibleOldestReadTransaction);
+                if (sizeAfterAllocation <= sizeLimit)
+                {
+                    // some long running transactions have finished
 
-                if (currentFile.HasDiscontinuousSpaceFor(tx, size, _scratchBuffers.Count))
+                    createNextFile = true;
+                }
+                else if (currentFile.HasDiscontinuousSpaceFor(tx, size, _scratchBuffers.Count))
                 {
                     // there is enough space for the requested allocation but the problem is its fragmentation
                     // so we will create a new scratch file and will allow to allocate new continuous range from there
 
                     createNextFile = true;
                 }
-                else if (_scratchBuffers.Count == 1 && currentFile.Size < _sizeLimit && 
-                        (currentFile.ActivelyUsedBytes(oldestActiveTransaction) + size * AbstractPager.PageSize) < _sizeLimit)
-                {
-                    // there is only one scratch file that hasn't reach the size limit yet and
-                    // the number of bytes being in active use allows to allocate the requested size
-                    // let it create a new file
-
-                    createNextFile = true;
-                }
 
                 if (createNextFile)
                 {
-                    // We need to ensure that _current stays constant through the codepath until return. 
-                    current = NextFile();
-
-                    try
-                    {
-                        tx.EnsurePagerStateReference(_current.File.PagerState);
-
-                        return current.File.Allocate(tx, numberOfPages, size);
-                    }
-                    finally
-                    {                        
-                        // That's why we update only after exiting. 
-                        _current = current;
-                    }
+                    return CreateNextFile(tx, numberOfPages, size);
                 }
 
                 var debugInfoBuilder = new StringBuilder();
@@ -225,6 +188,7 @@ namespace Voron.Impl.Scratch
                 debugInfoBuilder.AppendFormat("Current transaction id: {0}\r\n", tx.Id);
                 debugInfoBuilder.AppendFormat("Requested number of pages: {0} (adjusted size: {1} == {2:#,#;;0} KB)\r\n", numberOfPages, size, size * AbstractPager.PageSize / 1024);
                 debugInfoBuilder.AppendFormat("Oldest active transaction: {0} (snapshot: {1})\r\n", tx.Environment.OldestTransaction, oldestActiveTransaction);
+                debugInfoBuilder.AppendFormat("Possible oldest active transaction: {0}\r\n", tx.Environment.PossibleOldestReadTransaction);
                 debugInfoBuilder.AppendFormat("Oldest active transaction when flush was forced: {0}\r\n", current.OldestTransactionWhenFlushWasForced);
                 debugInfoBuilder.AppendFormat("Next write transaction id: {0}\r\n", tx.Environment.NextWriteTransactionId + 1);
 
@@ -266,7 +230,7 @@ namespace Voron.Impl.Scratch
                     currentFile.Size / 1024L,
                     currentFile.SizeAfterAllocation(size) / 1024L,
                     sizeAfterAllocation / 1024L,
-                    _sizeLimit / 1024L,
+                    sizeLimit / 1024L,
                     sp.ElapsedMilliseconds,
                     debugInfo
                     );
@@ -279,6 +243,71 @@ namespace Voron.Impl.Scratch
             _options.OnScratchBufferSizeChanged(sizeAfterAllocation);
 
             return result;
+        }
+
+        private void TryDeletingInactiveScratchBuffers(ScratchBufferItem current, long oldestActiveTransaction, bool ignoreLastCleanup)
+        {
+            if (_scratchBuffers.Count <= 1)
+                return;
+
+            if (ignoreLastCleanup == false && (DateTime.UtcNow - lastScratchBuffersCleanup).TotalMinutes < 10)
+                return;
+
+            var scratchesToDelete = new List<int>();
+
+            // determine how many bytes of older scratches are still in use (at least when this snapshot is taken)
+            foreach (var scratch in _scratchBuffers.Values)
+            {
+                if (scratch == current)
+                    continue;
+
+                if (scratch.File.HasActivelyUsedBytes(oldestActiveTransaction))
+                    continue;
+
+                scratchesToDelete.Add(scratch.Number);
+            }
+
+            // delete inactive scratches
+            foreach (var scratchNumber in scratchesToDelete)
+            {
+                ScratchBufferItem scratchBufferToRemove;
+                if (_scratchBuffers.TryRemove(scratchNumber, out scratchBufferToRemove))
+                {
+                    scratchBufferToRemove.File.Dispose();
+                }
+            }
+
+            lastScratchBuffersCleanup = DateTime.UtcNow;
+        }
+
+        private long GetTotalActivelyUsedBytes(long requestedSize, long oldestActiveTransaction)
+        {
+            var sizeAfterAllocation = requestedSize;
+
+            foreach (var scratch in _scratchBuffers.Values)
+            {
+                sizeAfterAllocation += scratch.File.ActivelyUsedBytes(oldestActiveTransaction);
+            }
+
+            return sizeAfterAllocation;
+        }
+
+        private PageFromScratchBuffer CreateNextFile(Transaction tx, int numberOfPages, long size)
+        {
+            // We need to ensure that _current stays constant through the codepath until return. 
+            var current = NextFile();
+
+            try
+            {
+                tx.EnsurePagerStateReference(_current.File.PagerState);
+
+                return current.File.Allocate(tx, numberOfPages, size);
+            }
+            finally
+            {
+                // That's why we update only after exiting. 
+                _current = current;
+            }
         }
 
         public void Free(int scratchNumber, long page, long asOfTxId)
@@ -303,9 +332,9 @@ namespace Voron.Impl.Scratch
 
             public ScratchBufferItem(int number, ScratchBufferFile file)
             {
-                this.Number = number;
-                this.File = file;
-                this.OldestTransactionWhenFlushWasForced = -1;
+                Number = number;
+                File = file;
+                OldestTransactionWhenFlushWasForced = -1;
             }
         }
 
@@ -329,6 +358,46 @@ namespace Voron.Impl.Scratch
 
             ScratchBufferFile bufferFile = item.File;
             return bufferFile.AcquirePagePointer(tx, p);       
+        }
+
+        public ScratchBufferPoolInfo InfoForDebug(long oldestActiveTransaction)
+        {
+            var currentFile = _current.File;
+            var scratchBufferPoolInfo = new ScratchBufferPoolInfo
+            {
+                OldestActiveTransaction = oldestActiveTransaction,
+                NumberOfScratchFiles = _scratchBuffers.Count,
+                CurrentFileSizeInMB = currentFile.Size / 1024L / 1024L,
+                PerScratchFileSizeLimitInMB = sizePerScratchLimit / 1024L / 1024L,
+                TotalScratchFileSizeLimitInMB = sizeLimit / 1024L / 1024L
+            };
+
+            foreach (var scratchBufferItem in _scratchBuffers.Values.OrderBy(x => x.Number))
+            {
+                var current = _current;
+                var scratchFileUsage = new ScratchFileUsage
+                {
+                    Name = StorageEnvironmentOptions.ScratchBufferName(scratchBufferItem.File.Number),
+                    SizeInKB = scratchBufferItem.File.Size / 1024,
+                    NumberOfAllocations = scratchBufferItem.File.NumberOfAllocations,
+                    InActiveUseInKB = scratchBufferItem.File.ActivelyUsedBytes(oldestActiveTransaction) / 1024,
+                    CanBeDeleted = scratchBufferItem != current && scratchBufferItem.File.HasActivelyUsedBytes(oldestActiveTransaction) == false,
+                    TxIdAfterWhichLatestFreePagesBecomeAvailable = scratchBufferItem.File.TxIdAfterWhichLatestFreePagesBecomeAvailable
+                };
+
+                foreach (var freePage in scratchBufferItem.File.GetMostAvailableFreePagesBySize())
+                {
+                    scratchFileUsage.MostAvailableFreePages.Add(new MostAvailableFreePagesBySize
+                    {
+                        Size = freePage.Key,
+                        ValidAfterTransactionId = freePage.Value
+                    });
+                }
+
+                scratchBufferPoolInfo.ScratchFilesUsage.Add(scratchFileUsage);
+            }
+
+            return scratchBufferPoolInfo;
         }
     }
 }

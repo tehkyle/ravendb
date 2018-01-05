@@ -18,14 +18,18 @@ namespace Raven.StorageExporter
 
         public static void PrintErrorAndFail(string ErrorMessage, string stackTrace = null)
         {
-            Console.Clear();
-            ConsoleUtils.ConsoleWriteLineWithColor(ConsoleColor.Red, ErrorMessage);
+            if (Console.IsOutputRedirected == false)
+                Console.Clear();
+
+            ConsoleWriteLineWithColor(ConsoleColor.Red, ErrorMessage);
             if (stackTrace != null)
             {
-                ConsoleUtils.ConsoleWriteLineWithColor(ConsoleColor.Blue, "StackTrace:\n" + stackTrace);
+                ConsoleWriteLineWithColor(ConsoleColor.Blue, "StackTrace:" + Environment.NewLine + stackTrace);
             }
-            Console.Read();
-            
+
+            if (Console.IsOutputRedirected == false)
+                Console.Read();
+
             throw new Exception(ErrorMessage);
         }
     }

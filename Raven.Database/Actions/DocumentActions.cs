@@ -12,7 +12,7 @@ using Raven.Abstractions.Exceptions;
 using Raven.Abstractions.Extensions;
 using Raven.Abstractions.Linq;
 using Raven.Abstractions.Logging;
-using Raven.Database.Data;
+using Raven.Abstractions.Util;
 using Raven.Database.Extensions;
 using Raven.Database.Impl;
 using Raven.Database.Indexing;
@@ -20,15 +20,14 @@ using Raven.Database.Linq;
 using Raven.Database.Plugins;
 using Raven.Database.Storage;
 using Raven.Database.Tasks;
-using Raven.Database.Util;
 using Raven.Json.Linq;
 
 namespace Raven.Database.Actions
 {
     public class DocumentActions : ActionsBase
     {
-        public DocumentActions(DocumentDatabase database, SizeLimitedConcurrentDictionary<string, TouchedDocumentInfo> recentTouches, IUuidGenerator uuidGenerator, ILog log)
-            : base(database, recentTouches, uuidGenerator, log)
+        public DocumentActions(DocumentDatabase database, IUuidGenerator uuidGenerator, ILog log)
+            : base(database, uuidGenerator, log)
         {
         }
 
@@ -228,11 +227,14 @@ namespace Raven.Database.Actions
             }
         }
 
-        private void RemoveMetadataReservedProperties(RavenJObject metadata)
+        private void RemoveMetadataReservedProperties(RavenJObject metadata, InvokeSource source = InvokeSource.Default)
         {
             RemoveReservedProperties(metadata);
             metadata.Remove("Raven-Last-Modified");
-            metadata.Remove("Last-Modified");
+            if (source != InvokeSource.FromConflictAtReplication)
+            {
+                metadata.Remove("Last-Modified");
+            }
         }
 
         private void RemoveReservedProperties(RavenJObject document)
@@ -289,8 +291,14 @@ namespace Raven.Database.Actions
                             {
                                 try
                                 {
-                                    if (string.IsNullOrEmpty(doc.Key))
+                                    if (string.IsNullOrWhiteSpace(doc.Key))
                                         throw new InvalidOperationException("Cannot try to bulk insert a document without a key");
+
+                                    doc.Key = doc.Key.Trim();
+                                    if (doc.Key[doc.Key.Length - 1] == '/')
+                                    {
+                                        doc.Key += GetNextIdentityValueWithoutOverwritingOnExistingDocuments(doc.Key, accessor);
+                                    }
 
                                     RemoveReservedProperties(doc.DataAsJson);
                                     RemoveMetadataReservedProperties(doc.Metadata);
@@ -413,13 +421,6 @@ namespace Raven.Database.Actions
             }
 
             return RavenJToken.DeepEquals(newMetadata, existingMetadata);
-        }
-
-        public TouchedDocumentInfo GetRecentTouchesFor(string key)
-        {
-            TouchedDocumentInfo info;
-            RecentTouches.TryGetValue(key, out info);
-            return info;
         }
 
         public RavenJArray GetDocumentsAsJson(int start, int pageSize, Etag etag,
@@ -708,14 +709,14 @@ namespace Raven.Database.Actions
             itemsToInclude = docRetriever.ItemsToInclude;
             return result;
         }
-
-
-        public PutResult Put(string key, Etag etag, RavenJObject document, RavenJObject metadata, TransactionInformation transactionInformation, string[] participatingIds = null)
+        
+        public PutResult Put(string key, Etag etag, RavenJObject document, RavenJObject metadata, TransactionInformation transactionInformation, 
+            IEnumerable<string> participatingIds = null,InvokeSource source = InvokeSource.Default)
         {
             WorkContext.MetricsCounters.DocsPerSecond.Mark();
             key = string.IsNullOrWhiteSpace(key) ? Guid.NewGuid().ToString() : key.Trim();
             RemoveReservedProperties(document);
-            RemoveMetadataReservedProperties(metadata);
+            RemoveMetadataReservedProperties(metadata,source);
             var newEtag = Etag.Empty;
 
             using (Database.DocumentLock.Lock())
@@ -735,11 +736,13 @@ namespace Raven.Database.Actions
 
                         Database.PutTriggers.Apply(trigger => trigger.OnPut(key, document, metadata, null));
 
-                        var addDocumentResult = actions.Documents.AddDocument(key, etag, document, metadata);
+                        var addDocumentResult = actions.Documents.AddDocument(key, etag, document, metadata, source);
                         newEtag = addDocumentResult.Etag;
 
                         Database.Indexes.CheckReferenceBecauseOfDocumentUpdate(key, actions, participatingIds);
+
                         metadata[Constants.LastModified] = addDocumentResult.SavedAt;
+                        
                         metadata.EnsureSnapshot(
                             "Metadata was written to the database, cannot modify the document after it was written (changes won't show up in the db). Did you forget to call CreateSnapshot() to get a clean copy?");
                         document.EnsureSnapshot(
@@ -803,13 +806,13 @@ namespace Raven.Database.Actions
             }
         }
 
-        public bool Delete(string key, Etag etag, TransactionInformation transactionInformation, string[] participatingIds = null)
+        public bool Delete(string key, Etag etag, TransactionInformation transactionInformation, IEnumerable<string> participatingIds = null)
         {
             RavenJObject metadata;
             return Delete(key, etag, transactionInformation, out metadata, participatingIds);
         }
 
-        public bool Delete(string key, Etag etag, TransactionInformation transactionInformation, out RavenJObject metadata, string[] participatingIds = null)
+        public bool Delete(string key, Etag etag, TransactionInformation transactionInformation, out RavenJObject metadata, IEnumerable<string> participatingIds = null)
         {
             if (key == null)
                 throw new ArgumentNullException("key");

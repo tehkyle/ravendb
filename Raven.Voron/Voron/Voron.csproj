@@ -62,6 +62,11 @@
     <Reference Include="System.IO.Compression.FileSystem" />
   </ItemGroup>
   <ItemGroup>
+    <Compile Include="..\..\CommonAssemblyInfo.cs">
+      <Link>Properties\CommonAssemblyInfo.cs</Link>
+    </Compile>
+    <Compile Include="Impl\Scratch\ScratchBufferPoolInfo.cs" />
+    <Compile Include="Properties\AssemblyInfo.cs" />
     <Compile Include="Debugging\StorageReport.cs" />
     <Compile Include="Debugging\StorageReportGenerator.cs" />
     <Compile Include="Exceptions\InvalidJournalFlushRequest.cs" />
@@ -72,6 +77,8 @@
     <Compile Include="Trees\Fixed\Iterators.cs" />
     <Compile Include="Impl\Backup\MinimalIncrementalBackup.cs" />
     <Compile Include="Impl\Compaction\StorageCompaction.cs" />
+    <Compile Include="Impl\FreeSpace\FreeSpaceHandlingDisabler.cs" />
+    <Compile Include="Impl\FreeSpace\FreeSpaceRecursiveCallGuard.cs" />
     <Compile Include="Impl\PagePosition.cs" />
     <Compile Include="Impl\Scratch\PageFromScratchBuffer.cs" />
     <Compile Include="Impl\Scratch\ScratchBufferFile.cs" />
@@ -154,7 +161,6 @@
     <Compile Include="Trees\Page.cs" />
     <Compile Include="Trees\PageFlags.cs" />
     <Compile Include="Trees\PageHeader.cs" />
-    <Compile Include="Properties\AssemblyInfo.cs" />
     <Compile Include="Slice.cs" />
     <Compile Include="SliceOptions.cs" />
     <Compile Include="StorageEnvironment.cs" />

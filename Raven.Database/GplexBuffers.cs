@@ -14,11 +14,11 @@ using System.Diagnostics.CodeAnalysis;
 using System.Runtime.Serialization;
 using System.Globalization;
 using System.Runtime.CompilerServices;
-using Raven.Abstractions.Threading;
+using System.Threading;
 
 namespace QUT.GplexBuffers
 {
-// Code copied from GPLEX embedded resource
+    // Code copied from GPLEX embedded resource
     [Serializable]
     public class BufferException : Exception
     {
@@ -69,7 +69,7 @@ namespace QUT.GplexBuffers
         }
 #endif // !BYTEMODE
 #endif // !NOFILES
-        public bool SetPaddingOn { get; set; }
+        public bool EscapeCommaMode { get; set; }
         protected CommaState state { get; set; }
         protected enum CommaState
         {
@@ -103,45 +103,28 @@ namespace QUT.GplexBuffers
             this.sLen = source.Length;
             this.FileName = null;
         }
+
         public override int Read()
         {
-            if (SetPaddingOn)
+            if (EscapeCommaMode)
             {
-                // escaping ',' into ,
-                if (bPos + 2 < sLen && str[bPos] == 96 && str[bPos] == 44 && str[bPos + 2] == 96)
-                {
-                    bPos += 3;
-                    return 44;
-                }
-                // padding comma state
+                // Swallowing commas into space
                 if (bPos < sLen)
                 {
                     var res = str[bPos];
-                    switch (state)
-                    {
-                        case CommaState.None:						
-                            if (res == 44)
-                            {
-                                state = CommaState.Comma;
-                                return 32;
-                            }
-                            bPos++;
-                            return res;
-                        case CommaState.Comma:
-                            state = CommaState.AfterComma;
-                            return 44;
-                        case CommaState.AfterComma:						
-                            state = CommaState.None;
-                            bPos++;
-                        return 32;						
-                    }
-                }					
-                else if (bPos == sLen) { bPos++; return '\n'; }   // one strike, see new line
-                else { bPos++; return EndOfFile; }                // two strikes and you're out!
+                    var pos = bPos;
+                    bPos++;
+                    //making sure not to swallow ',' when it is escaped 
+                    if (res == 44 && !(pos > 1 && pos + 1 < sLen && str[pos - 1] == 96 && str[pos + 1] == 96))
+                        return 32;
+                    return res;
+                }
+                if (bPos == sLen) { bPos++; return '\n'; }   // one strike, see new line
+                bPos++; return EndOfFile;
             }
             if (bPos < sLen) return str[bPos++];
-            else if (bPos == sLen) { bPos++; return '\n'; }   // one strike, see new line
-            else { bPos++; return EndOfFile; }                // two strikes and you're out!
+            if (bPos == sLen) { bPos++; return '\n'; }   // one strike, see new line
+            bPos++; return EndOfFile;
         }
 
         public override string GetString(int begin, int limit)
@@ -264,7 +247,7 @@ namespace QUT.GplexBuffers
             StringBuilder sb = new StringBuilder();
             if (begCol < s.Length)
                 sb.Append(s.Substring(begCol));
-            for (; ; )
+            for (;;)
             {
                 sb.Append("\n");
                 s = line[++begIx];
@@ -433,7 +416,7 @@ namespace QUT.GplexBuffers
         public override int Read()
         {
             int res = EndOfFile;
-            if (SetPaddingOn)
+            if (EscapeCommaMode)
             {
                 switch (state)
                 {
@@ -495,7 +478,7 @@ namespace QUT.GplexBuffers
                     return (int)data[bPos++];
                 }
             }
-            
+
         }
         char[] chrs = new char[4096];
 
@@ -524,7 +507,7 @@ namespace QUT.GplexBuffers
         private static readonly ThreadLocal<byte[]> buffer = new ThreadLocal<byte[]>(() => new byte[4096]);
         public static BlockReader Raw(Stream stream)
         {
-            return delegate(char[] block, int index, int number)
+            return delegate (char[] block, int index, int number)
             {
                 int count = stream.Read(buffer.Value, 0, Math.Min(number, buffer.Value.Length));
                 int i = 0;
@@ -627,7 +610,7 @@ namespace QUT.GplexBuffers
             return 0;
         }
     }
-#region guesser
+    #region guesser
 #if (!BYTEMODE)
     // ==============================================================
     // ============          Encoding Guesser           =============
@@ -734,7 +717,7 @@ namespace QUT.GplexBuffers
 
         int Scan()
         {
-            for (; ; )
+            for (;;)
             {
                 int next;
                 state = currentStart;
@@ -798,10 +781,10 @@ namespace QUT.GplexBuffers
             }
         }
     } // end class Guesser
-    
+
 #endif // !BYTEMODE
-#endregion
+    #endregion
 #endif // !NOFILES
 
-// End of code copied from embedded resource
+    // End of code copied from embedded resource
 }

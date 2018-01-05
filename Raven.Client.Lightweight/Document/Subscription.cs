@@ -28,11 +28,25 @@ namespace Raven.Client.Document
 {
     public delegate void BeforeBatch();
 
+    /// <summary>
+    /// Called before received batch starts to be proccessed by subscribers
+    /// </summary>
+    /// <param name="documentsProcessed">number of documents that were proccessed in current batch</param>
     public delegate void AfterBatch(int documentsProcessed);
 
+    /// <summary>
+    /// Called before received batch starts to be proccessed by subscribers
+    /// </summary>
+    /// <returns></returns>
     public delegate bool BeforeAcknowledgment();
 
+    /// <summary>
+    /// 
+    /// </summary>
+    /// <param name="lastProcessedEtag"></param>
     public delegate void AfterAcknowledgment(Etag lastProcessedEtag);
+
+    public delegate void SubscriptionConnectionInterrupted(Exception ex, bool willReconnect);
 
     public class Subscription<T> : IObservable<T>, IDisposableAsync, IDisposable where T : class
     {
@@ -62,11 +76,38 @@ namespace Raven.Client.Document
         private bool completed;
         private bool disposed;
         private bool firstConnection = true;
+        private TaskCompletionSource<bool> taskCompletionSource = new TaskCompletionSource<bool>();
+        public event Action OnDispose;
 
+        /// <summary>
+        /// Task that will be completed when the subscription connection will close and self dispose, or errorous if subscription connection is entirely interrupted
+        /// </summary>
+        public Task SubscriptionLifetimeTask { private set; get; }
+
+        /// <summary>
+        /// Called before received batch starts to be proccessed by subscribers
+        /// </summary>
         public event BeforeBatch BeforeBatch = delegate { };
+
+        /// <summary>
+        /// Called after received batch finished being proccessed by subscribers
+        /// </summary>
         public event AfterBatch AfterBatch = delegate { };
+
+        /// <summary>
+        /// Called before subscription progress is being stored to the DB
+        /// </summary>
         public event BeforeAcknowledgment BeforeAcknowledgment = () => true;
+
+        /// <summary>
+        /// Called after subscription progress has been stored to the DB 
+        /// </summary>
         public event AfterAcknowledgment AfterAcknowledgment = delegate { };
+
+        /// <summary>
+        /// Called when subscription connection is interrupted. The error passed will describe the reason for the interruption. 
+        /// </summary>
+        public event SubscriptionConnectionInterrupted SubscriptionConnectionInterrupted = delegate { };
 
         internal Subscription(long id, string database, SubscriptionConnectionOptions options, IAsyncDatabaseCommands commands, IDatabaseChanges changes, DocumentConvention conventions, bool open, Func<Task> ensureOpenSubscription)
         {
@@ -76,6 +117,8 @@ namespace Raven.Client.Document
             this.changes = changes;
             this.conventions = conventions;
             this.ensureOpenSubscription = ensureOpenSubscription;
+
+            SubscriptionLifetimeTask = taskCompletionSource.Task;
 
             if (typeof(T) != typeof(RavenJObject))
             {
@@ -94,7 +137,7 @@ namespace Raven.Client.Document
             if (options.Strategy == SubscriptionOpeningStrategy.WaitForFree)
                 WaitForSubscriptionReleased();
         }
-
+       
         private void Start()
         {
             StartWatchingDocs();
@@ -178,6 +221,10 @@ namespace Raven.Client.Document
                                                                 {
                                                                     // can happen if a subscriber doesn't have an onError handler - just ignore it
                                                                 }
+
+                                                                SubscriptionConnectionInterrupted(ex, false);
+                                                                taskCompletionSource.TrySetException(ex);
+
                                                                 break;
                                                             }
                                                         }
@@ -235,7 +282,14 @@ namespace Raven.Client.Document
                                 // This is an acknowledge when the server returns documents to the subscriber.
                                 if (BeforeAcknowledgment())
                                 {
-                                    AcknowledgeBatchToServer(lastProcessedEtagOnServer);
+                                    try
+                                    {
+                                        AcknowledgeBatchToServer(lastProcessedEtagOnServer);
+                                    }
+                                    catch (SubscriptionAckTimeoutException ex)
+                                    {
+                                        SubscriptionConnectionInterrupted(ex, true);
+                                    }
 
                                     AfterAcknowledgment(lastProcessedEtagOnServer);
                                 }
@@ -251,7 +305,14 @@ namespace Raven.Client.Document
                                     // This is a silent acknowledge, this can happen because there was no documents in range
                                     // to be accessible in the time available. This condition can happen when documents must match
                                     // a set of conditions to be eligible.
-                                    AcknowledgeBatchToServer(lastProcessedEtagOnServer);
+                                    try
+                                    {
+                                        AcknowledgeBatchToServer(lastProcessedEtagOnServer);
+                                    }
+                                    catch (SubscriptionAckTimeoutException ex)
+                                    {
+                                        SubscriptionConnectionInterrupted(ex, true);
+                                    }
 
                                     lastProcessedEtagOnClient = lastProcessedEtagOnServer;
 
@@ -288,10 +349,12 @@ namespace Raven.Client.Document
                 {
                     acknowledgmentRequest.ExecuteRequest();
                 }
-                catch (Exception)
+                catch (Exception ex)
                 {
                     if (acknowledgmentRequest.ResponseStatusCode != HttpStatusCode.RequestTimeout) // ignore acknowledgment timeouts
                         throw;
+
+                    throw new SubscriptionAckTimeoutException("Subscription Acknowledgement timeout received. Last Etag was not updated and current batch will be proccessed again", ex);
                 }
             }
         }
@@ -338,8 +401,11 @@ namespace Raven.Client.Document
                 {
                     if (logger.IsDebugEnabled)
                         logger.Debug(string.Format("Subscription #{0}. Stopping the connection '{1}'", id, options.ConnectionId));
+
+                    SubscriptionConnectionInterrupted(ex, false);
                     return;
                 }
+                SubscriptionConnectionInterrupted(ex, true);
 
 #pragma warning disable CS4014 // Because this call is not awaited, execution of the current method continues before the call is completed
                 RestartPullingTask().ConfigureAwait(false);
@@ -370,7 +436,10 @@ namespace Raven.Client.Document
             catch (Exception ex)
             {
                 if (TryHandleRejectedConnection(ex, reopenTried: true))
+                {
+                    SubscriptionConnectionInterrupted(ex, false);
                     return;
+                }
 
 #pragma warning disable CS4014 // Because this call is not awaited, execution of the current method continues before the call is completed
                 RestartPullingTask().ConfigureAwait(false);
@@ -394,7 +463,9 @@ namespace Raven.Client.Document
                 startPullingTask = null; // prevent from calling Wait() on this in Dispose because we can be already inside this task
                 pullingTask = null; // prevent from calling Wait() on this in Dispose because we can be already inside this task
 
+                taskCompletionSource.TrySetException(ex);
                 Dispose();
+                
 
                 return true;
             }
@@ -507,9 +578,16 @@ namespace Raven.Client.Document
             if (disposed)
                 return new CompletedTask();
 
+            OnDispose?.Invoke();
+
             disposed = true;
 
             OnCompletedNotification();
+
+            if (taskCompletionSource.Task.IsCanceled == false && taskCompletionSource.Task.IsCompleted == false)
+            {
+                taskCompletionSource.TrySetResult(true);
+            }
 
             subscribers.Clear();
 

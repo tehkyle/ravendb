@@ -204,6 +204,7 @@ namespace Raven.Tests.Core.Configuration
             configurationComparer.Assert(expected => expected.Voron.ScratchBufferSizeNotificationThreshold.Value, actual => actual.Storage.Voron.ScratchBufferSizeNotificationThreshold);
             configurationComparer.Assert(expected => expected.Voron.MaxBufferPoolSize.Value, actual => actual.Storage.Voron.MaxBufferPoolSize);
             configurationComparer.Assert(expected => expected.Voron.MaxScratchBufferSize.Value, actual => actual.Storage.Voron.MaxScratchBufferSize);
+            configurationComparer.Assert(expected => expected.Voron.MaxSizePerScratchBufferFile.Value, actual => actual.Storage.Voron.MaxSizePerScratchBufferFile);
             configurationComparer.Assert(expected => expected.Voron.TempPath.Value, actual => actual.Storage.Voron.TempPath);
             configurationComparer.Assert(expected => expected.Esent.CacheSizeMax.Value, actual => actual.Storage.Esent.CacheSizeMax);
             configurationComparer.Assert(expected => expected.Esent.MaxVerPages.Value, actual => actual.Storage.Esent.MaxVerPages);
@@ -237,7 +238,6 @@ namespace Raven.Tests.Core.Configuration
 
             configurationComparer.Assert(expected => expected.LowMemoryLimitForLinuxDetectionInMB.Value, actual => actual.LowMemoryForLinuxDetectionInMB);
             
-
             configurationComparer.Assert(expected => expected.TimeToWaitBeforeMarkingAutoIndexAsIdle.Value, actual => actual.TimeToWaitBeforeMarkingAutoIndexAsIdle);
             configurationComparer.Assert(expected => expected.RedirectStudioUrl.Value, actual => actual.RedirectStudioUrl);
             configurationComparer.Assert(expected => expected.ResetIndexOnUncleanShutdown.Value, actual => actual.ResetIndexOnUncleanShutdown);
@@ -255,7 +255,6 @@ namespace Raven.Tests.Core.Configuration
             configurationComparer.Assert(expected => expected.AccessControlAllowMethods.Value, actual => actual.AccessControlAllowMethods);
             configurationComparer.Assert(expected => expected.AccessControlRequestHeaders.Value, actual => actual.AccessControlRequestHeaders);
             configurationComparer.Assert(expected => expected.HttpCompression.Value, actual => actual.HttpCompression);
-            configurationComparer.Assert(expected => expected.AllowLocalAccessWithoutAuthorization.Value, actual => actual.AllowLocalAccessWithoutAuthorization);
             configurationComparer.Assert(expected => expected.RunInMemory.Value, actual => actual.RunInMemory);
             configurationComparer.Assert(expected => expected.DisableInMemoryIndexing.Value, actual => actual.DisableInMemoryIndexing);
             configurationComparer.Assert(expected => expected.WebDir.Value, actual => actual.WebDir);
@@ -274,7 +273,6 @@ namespace Raven.Tests.Core.Configuration
             configurationComparer.Assert(expected => expected.TurnOffDiscoveryClient.Value, actual => actual.TurnOffDiscoveryClient);
             configurationComparer.Assert(expected => expected.ServerName.Value, actual => actual.ServerName);
             configurationComparer.Assert(expected => expected.MaxStepsForScript.Value, actual => actual.MaxStepsForScript);
-            configurationComparer.Assert(expected => expected.MaxRecentTouchesToRemember.Value, actual => actual.MaxRecentTouchesToRemember);
             configurationComparer.Assert(expected => expected.AdditionalStepsForScriptBasedOnDocumentSize.Value, actual => actual.AdditionalStepsForScriptBasedOnDocumentSize);
             configurationComparer.Assert(expected => expected.MaxIndexWritesBeforeRecreate.Value, actual => actual.MaxIndexWritesBeforeRecreate);
             configurationComparer.Assert(expected => expected.MaxSimpleIndexOutputsPerDocument.Value, actual => actual.MaxSimpleIndexOutputsPerDocument);
@@ -333,6 +331,7 @@ namespace Raven.Tests.Core.Configuration
             configurationComparer.Assert(expected => expected.Cluster.MaxLogLengthBeforeCompaction.Value, actual => actual.Cluster.MaxLogLengthBeforeCompaction);
             configurationComparer.Assert(expected => expected.TempPath.Value, actual => actual.TempPath);
             configurationComparer.Assert(expected => expected.Cluster.MaxReplicationLatency.Value, actual => actual.Cluster.MaxReplicationLatency);
+            configurationComparer.Assert(expected => expected.FileSystem.DisableRDC.Value, actual => actual.FileSystem.DisableRDC);
 
             configurationComparer.Ignore(x => x.Storage.Esent.JournalsStoragePath);
             configurationComparer.Ignore(x => x.Storage.Voron.JournalsStoragePath);
@@ -340,9 +339,7 @@ namespace Raven.Tests.Core.Configuration
             configurationComparer.Ignore(x => x.IgnoreSslCertificateErrors);
             configurationComparer.Ignore(x => x.AnonymousUserAccessMode);
             configurationComparer.Ignore(x => x.TransactionMode);
-
-            
-            
+            configurationComparer.Ignore(x => x.CustomMemoryCacher);
 
             Assert.NotNull(inMemoryConfiguration.OAuthTokenKey);
             Assert.Equal("/", inMemoryConfiguration.VirtualDirectory);

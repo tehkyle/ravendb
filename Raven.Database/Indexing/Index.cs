@@ -270,23 +270,36 @@ namespace Raven.Database.Indexing
 
                 foreach (var indexExtension in indexExtensions)
                 {
-                    indexExtension.Value.Dispose();
+                    try
+                    {
+                        indexExtension.Value.Dispose();
+                    }
+                    catch (Exception e)
+                    {
+                        logIndexing.WarnException($"Failed to dispose index extension '{indexExtension.Key}'", e);
+                    }
                 }
 
                 if (currentIndexSearcherHolder != null)
                 {
-                    var item = currentIndexSearcherHolder.SetIndexSearcher(null, PublicName, wait: true);
-                    if (item.WaitOne(TimeSpan.FromSeconds(5)) == false)
+                    try
                     {
-                        logIndexing.Warn("After closing the index searching, we waited for 5 seconds for the searching to be done, but it wasn't. Continuing with normal shutdown anyway.");
+                        var item = currentIndexSearcherHolder.SetIndexSearcher(null, PublicName, wait: true);
+                        if (item.WaitOne(TimeSpan.FromSeconds(5)) == false)
+                        {
+                            logIndexing.Warn("After closing the index searching, we waited for 5 seconds for the searching to be done, but it wasn't. Continuing with normal shutdown anyway.");
+                        }
+                    }
+                    catch (Exception e)
+                    {
+                        logIndexing.WarnException("Failed to wait for the index searching to be done", e);
                     }
                 }
 
                 try
                 {
-                    EnsureIndexWriter(useWriteLock: false, isDisposing: true);
                     ForceWriteToDisk();
-                    WriteInMemoryIndexToDiskIfNecessary(GetLastEtagFromStats(), useWriteLock: false, isDisposing: true);
+                    WriteInMemoryIndexToDiskIfNecessary(GetLastEtagFromStats(), isDisposing: true);
                 }
                 catch (Exception e)
                 {
@@ -332,18 +345,14 @@ namespace Raven.Database.Indexing
             }
         }
 
-        public void EnsureIndexWriter(bool useWriteLock, bool isDisposing = false)
+        public void EnsureIndexWriter(bool isDisposing = false)
         {
             if (indexWriter != null)
                 return;
 
-            var lockTaken = false;
             try
             {
-                if (useWriteLock)
-                {
-                    Monitor.Enter(writeLock, ref lockTaken);
-                }
+                Monitor.Enter(writeLock);
 
                 if (indexWriter != null)
                     return;
@@ -351,7 +360,7 @@ namespace Raven.Database.Indexing
                 if (isDisposing == false && disposed)
                     throw new ObjectDisposedException("Index " + PublicName + " has been disposed");
 
-                CreateIndexWriter(isDisposing: isDisposing);
+                CreateIndexWriter(isDisposing);
             }
             catch (IOException e)
             {
@@ -360,12 +369,11 @@ namespace Raven.Database.Indexing
             }
             finally
             {
-                if (lockTaken)
-                    Monitor.Exit(writeLock);
+                Monitor.Exit(writeLock);
             }
         }
 
-        public void Flush(Etag highestETag, bool considerLastCommitedTime = false)
+        public void Flush(Etag highestETag, bool forceFlush = false, bool considerLastCommitedTime = false)
         {
             try
             {
@@ -383,7 +391,9 @@ namespace Raven.Database.Indexing
                     {
                         try
                         {
-                            indexWriter.Commit(highestETag, considerLastCommitedTime);
+                            indexWriter.Commit(highestETag, 
+                                forceCommit: forceFlush, 
+                                considerLastCommitedTime: considerLastCommitedTime);
                         }
                         catch (Exception e)
                         {
@@ -419,7 +429,7 @@ namespace Raven.Database.Indexing
                     logIndexing.Info("Starting merge of {0}", PublicName);
                     var sp = Stopwatch.StartNew();
 
-                    EnsureIndexWriter(useWriteLock: false);
+                    EnsureIndexWriter();
 
                     try
                     {
@@ -567,6 +577,9 @@ namespace Raven.Database.Indexing
 
             lock (writeLock)
             {
+                if (disposed)
+                    throw new ObjectDisposedException("Index " + PublicName + " has been disposed");
+
                 bool shouldRecreateSearcher;
                 var toDispose = new List<Action>();
                 Analyzer searchAnalyzer = null;
@@ -586,7 +599,7 @@ namespace Raven.Database.Indexing
                         throw;
                     }
 
-                    EnsureIndexWriter(useWriteLock: false);
+                    EnsureIndexWriter();
 
                     var locker = directory.MakeLock("writing-to-index.lock");
                     try
@@ -646,11 +659,11 @@ namespace Raven.Database.Indexing
                         {
                             using (StopwatchScope.For(flushToDiskDuration))
                             {
-                                WriteInMemoryIndexToDiskIfNecessary(itemsInfo.HighestETag, useWriteLock: false);
+                                WriteInMemoryIndexToDiskIfNecessary(itemsInfo.HighestETag);
 
                                 if (indexWriter != null && indexWriter.RamSizeInBytes() >= flushSize)
                                 {
-                                    Flush(itemsInfo.HighestETag); // just make sure changes are flushed to disk
+                                    Flush(itemsInfo.HighestETag, forceFlush: true); // just make sure changes are flushed to disk
                                     flushed = true;
                                 }
                             }
@@ -721,7 +734,10 @@ namespace Raven.Database.Indexing
             {
                 var old = indexindDone;
                 Interlocked.Exchange(ref indexindDone, new TaskCompletionSource<object>());
-                Task.Factory.StartNew(() => old.TrySetResult(null));
+                Task.Factory.StartNew(() =>
+                {
+                    old.TrySetResult(null);
+                });
             }
 
             if (writePerformanceStats != null)
@@ -795,10 +811,12 @@ namespace Raven.Database.Indexing
             }
         }
 
-        private void CreateIndexWriter(bool isDisposing)
+        private void CreateIndexWriter(bool isDisposing = false)
         {
             if (isDisposing == false && disposed)
                 throw new OperationCanceledException();
+
+            Debug.Assert(Monitor.IsEntered(writeLock));
 
             try
             {
@@ -815,22 +833,29 @@ namespace Raven.Database.Indexing
             }
         }
 
-        internal void WriteInMemoryIndexToDiskIfNecessary(Etag highestETag, bool useWriteLock, bool isDisposing = false)
+        internal void WriteInMemoryIndexToDiskIfNecessary(Etag highestETag, bool isDisposing = false)
         {
             if (context.Configuration.RunInMemory ||
                 context.IndexDefinitionStorage == null) // may happen during index startup
                 return;
 
+            if (indexWriter == null)
+                return; // may happen if we didn't write to index after a reset
+
             var dir = indexWriter.Directory as RAMDirectory;
             if (dir == null)
             {
-                if (isDisposing)
+                if (isDisposing == false)
+                    return;
+
+                // if we are disposing, we need to flush the highest etag 
+                // to prevent resetting the index etag to the last commited one on restart
+                lock (writeLock)
                 {
-                    // if we are disposing, we need to flush the highest etag 
-                    // to prevent resetting the index etag to the last commited one on restart 
+                    EnsureIndexWriter(isDisposing: true);
                     indexWriter.Commit(highestETag, forceCommit: true);
                 }
-                    
+
                 return;
             }
 
@@ -842,13 +867,9 @@ namespace Raven.Database.Indexing
             if (forceWriteToDisk || toobig || !stale || tooOld)
             {
                 // fix a race condition when trying to write the in memory index to disk concurrently
-                var lockTaken = false;
                 try
                 {
-                    if (useWriteLock)
-                    {
-                        Monitor.Enter(writeLock, ref lockTaken);
-                    }
+                    Monitor.Enter(writeLock);
 
                     dir = indexWriter.Directory as RAMDirectory;
                     // ReSharper disable once ConditionIsAlwaysTrueOrFalse
@@ -869,8 +890,7 @@ namespace Raven.Database.Indexing
                 }
                 finally
                 {
-                    if (lockTaken)
-                        Monitor.Exit(writeLock);
+                    Monitor.Exit(writeLock);
                 }
             }
         }
@@ -2114,7 +2134,7 @@ namespace Raven.Database.Indexing
                 (Priority & IndexingPriority.Disabled) == IndexingPriority.Disabled)
                 return;
 
-            var title = $"Index '{PublicName}' marked as disabled due to exceeding the error limit {(ErrorsLimit)}";
+            var title = $"Index '{PublicName}' marked as disabled due to exceeding the error limit {ErrorsLimit}";
             var errorMessage = $"Index '{PublicName}' exceeded the error limit. " +
                                "The index priority was set to disabled.";
 
@@ -2306,11 +2326,22 @@ namespace Raven.Database.Indexing
 
         public LowMemoryHandlerStatistics HandleLowMemory()
         {
-            bool tryEnter = false;
+            var tryEnter = false;
             var res = new LowMemoryHandlerStatistics();
             try
             {
                 tryEnter = Monitor.TryEnter(writeLock);
+
+                if (disposed)
+                {
+                    return new LowMemoryHandlerStatistics
+                    {
+                        Name = $"Index: {PublicName}",
+                        DatabaseName = context.DatabaseName,
+                        Summary = "Index is already disposed. Nothing to free.",
+                        EstimatedUsedMemory = 0
+                    };
+                }
 
                 if (tryEnter == false)
                     return res;
@@ -2321,7 +2352,7 @@ namespace Raven.Database.Indexing
                     if (indexWriter != null)
                     {
                         ForceWriteToDisk();
-                        WriteInMemoryIndexToDiskIfNecessary(GetLastEtagFromStats(), useWriteLock: true);
+                        WriteInMemoryIndexToDiskIfNecessary(GetLastEtagFromStats());
                     }
                 }
                 catch (Exception e)
@@ -2331,7 +2362,7 @@ namespace Raven.Database.Indexing
                 RecreateSearcher();
                 return new LowMemoryHandlerStatistics
                 {
-                    Name = $"CachedIndexedTerms:{PublicName}",
+                    Name = $"Index: {PublicName}",
                     DatabaseName = context.DatabaseName,
                     Summary = $"Writing in memory index {IndexId} to disk, recreating index readers and writers, freeing write and read cache"
                 };

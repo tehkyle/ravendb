@@ -18,10 +18,8 @@ using Raven.Abstractions.Extensions;
 using Raven.Abstractions.Logging;
 using Raven.Abstractions.Util;
 using Raven.Database.Config;
-using Raven.Database.Data;
 using Raven.Database.Extensions;
 using Raven.Database.Impl;
-using Raven.Database.Util;
 using Raven.Json.Linq;
 using Voron.Impl.Backup;
 
@@ -32,8 +30,8 @@ namespace Raven.Database.Actions
         private readonly ConcurrentQueue<DeleteIndexTask> pendingDeletions = new ConcurrentQueue<DeleteIndexTask>();
         private readonly InterlockedLock interlockedLock = new InterlockedLock();
 
-        public MaintenanceActions(DocumentDatabase database, SizeLimitedConcurrentDictionary<string, TouchedDocumentInfo> recentTouches, IUuidGenerator uuidGenerator, ILog log)
-            : base(database, recentTouches, uuidGenerator, log)
+        public MaintenanceActions(DocumentDatabase database, IUuidGenerator uuidGenerator, ILog log)
+            : base(database, uuidGenerator, log)
         {
         }
 
@@ -49,7 +47,7 @@ namespace Raven.Database.Actions
             return backupPath ?? Path.Combine(rootBackupPath, Constants.DatabaseDocumentFilename);
         }
 
-        public static void Restore(RavenConfiguration configuration, DatabaseRestoreRequest restoreRequest, Action<string> output)
+        public static void Restore(RavenConfiguration configuration, DatabaseRestoreRequest restoreRequest, Action<string> output, InMemoryRavenConfiguration globalConfiguration = null)
         {
             var databaseDocumentPath = FindDatabaseDocument(restoreRequest.BackupLocation);
             if (File.Exists(databaseDocumentPath) == false)
@@ -80,10 +78,10 @@ namespace Raven.Database.Actions
             {
                 configuration.DataDirectory = restoreRequest.DatabaseLocation;
             }
-
+            
             using (var transactionalStorage = configuration.CreateTransactionalStorage(storage, () => { }, () => { }))
             {
-                transactionalStorage.Restore(restoreRequest, output);
+                transactionalStorage.Restore(restoreRequest, output, globalConfiguration);
             }
         }
 
@@ -137,9 +135,13 @@ namespace Raven.Database.Actions
                 .ContinueWith(_ => linkedTokenSource.Dispose());
         }
 
-        public void RemoveAllBefore(string listName,Etag etag)
+        public void RemoveAllBefore(string listName,Etag etag, TimeSpan? timeout = null)
         {
-            TransactionalStorage.Batch(accessor => accessor.Lists.RemoveAllBefore(listName,etag));
+            using (Database.DocumentLock.Lock())
+            {
+                TransactionalStorage.Batch(accessor => accessor.Lists.RemoveAllBefore(listName, etag, timeout));
+            }
+            
         }
 
         public void PurgeOutdatedTombstones()
@@ -212,6 +214,7 @@ namespace Raven.Database.Actions
                             // Even though technically we are running into a situation that is considered to be corrupt data
                             // we can safely recover from it by removing the other parts of the index.
                             Database.IndexStorage.DeleteIndex(indexId);
+                            actions.Indexing.PrepareIndexForDeletion(indexId);
                             actions.Indexing.DeleteIndex(indexId, WorkContext.CancellationToken);
 
                             string indexName;

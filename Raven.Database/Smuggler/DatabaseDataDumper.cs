@@ -64,7 +64,7 @@ namespace Raven.Database.Smuggler
                     From = Operations,
                     To = importOperations,
                     IncrementalKey = betweenOptions.IncrementalKey
-                }, Options)
+                }, Options, null)
                 .ConfigureAwait(false);
             }
         }
@@ -83,7 +83,8 @@ namespace Raven.Database.Smuggler
             {
                 Url = connectionStringOptions.Url,
                 ApiKey = connectionStringOptions.ApiKey,
-                Credentials = credentials ?? CredentialCache.DefaultNetworkCredentials
+                Credentials = credentials ?? CredentialCache.DefaultNetworkCredentials,
+                AvoidCluster = true
             };
 
             s.Initialize();

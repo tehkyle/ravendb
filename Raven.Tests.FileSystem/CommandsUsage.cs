@@ -464,6 +464,19 @@ namespace Raven.Tests.FileSystem
             Assert.NotNull(client.GetMetadataForAsync("name#.bin").Result);
         }
 
+        [Fact]
+        public void Can_query_file_with_hash_in_name()
+        {
+            var client = NewAsyncClient();
+
+            client.UploadAsync("name#.bin", new MemoryStream(new byte[] { 1, 2, 3 })).Wait();
+
+            var results = client.SearchAsync("__rfileName:nib.#eman*").Result;
+
+            Assert.Equal(1, results.FileCount);
+            Assert.Equal("name#.bin", results.Files[0].Name);
+        }
+
         private void ExecuteWithSimplifiedException ( Action action )
         {
             try
@@ -738,8 +751,7 @@ namespace Raven.Tests.FileSystem
                                             {"test", "2"}
                                         }, etag: etag);
 
-            await ThrowsAsync<ConcurrencyException>(() => client.UploadAsync("1.txt", new RandomStream(256), etag: etag.IncrementBy(10)));
-
+            Assert.Throws<ConcurrencyException>(() => AsyncHelpers.RunSync(() => client.UploadAsync("1.txt", new RandomStream(256), etag: etag.IncrementBy(10))));
         }
 
         [Fact]
@@ -798,7 +810,7 @@ namespace Raven.Tests.FileSystem
             var etag1 = fileMetadata[0].Etag;
             await client.DeleteAsync("1.txt", etag1);
 
-            var ex = await ThrowsAsync<ConcurrencyException>(() => client.DeleteAsync("2.txt", etag1 /* we are using wrong etag here */));
+            var ex = Assert.Throws<ConcurrencyException>(() => AsyncHelpers.RunSync(() => client.DeleteAsync("2.txt", etag1 /* we are using wrong etag here */)));
 
             Assert.Equal("Operation attempted on file '/2.txt' using a non current etag", ex.Message);
 
@@ -835,7 +847,7 @@ namespace Raven.Tests.FileSystem
             var etag1 = fileMetadata[0].Etag;
             await client.RenameAsync("1.txt", "1.new.txt", etag1);
 
-            await ThrowsAsync<ConcurrencyException>(() => client.RenameAsync("2.txt", "2.new.txt", etag1 /* we are using wrong etag here */));
+            Assert.Throws<ConcurrencyException>(() => AsyncHelpers.RunSync(() => client.RenameAsync("2.txt", "2.new.txt", etag1 /* we are using wrong etag here */)));
 
             fileMetadata = await client.GetAsync(new[] { "1.txt", "1.new.txt", "2.txt", "2.new.txt" });
             Assert.NotNull(fileMetadata);
@@ -872,10 +884,10 @@ namespace Raven.Tests.FileSystem
                 {"test-new", "1"}
             }, etag1);
 
-            await ThrowsAsync<ConcurrencyException>(() => client.UpdateMetadataAsync("2.txt", new RavenJObject
+            Assert.Throws<ConcurrencyException>(() => AsyncHelpers.RunSync(() => client.UpdateMetadataAsync("2.txt", new RavenJObject
             {
                 {"test-new2", "4"}
-            }, etag1 /* we are using wrong etag here */));
+            }, etag1 /* we are using wrong etag here */)));
 
             fileMetadata = await client.GetAsync(new[] { "1.txt", "2.txt" });
             Assert.NotNull(fileMetadata);

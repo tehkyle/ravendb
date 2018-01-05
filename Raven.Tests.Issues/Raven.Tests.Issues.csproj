@@ -138,7 +138,29 @@
     <Compile Include="1379\RavenDB_1379_Client_Lazy.cs" />
     <Compile Include="1379\RavenDB_1379_Client_Remote.cs" />
     <Compile Include="ActualValueInJsonReaderException.cs" />
+    <Compile Include="Backup_restore_backup.cs" />
+    <Compile Include="FullAndIncrementalBackups.cs" />
+    <Compile Include="NtpServers.cs" />
+    <Compile Include="RavenDB-7972.cs" />
+    <Compile Include="RavenDB_7873.cs" />
+    <Compile Include="RavenDB-7406.cs" />
+    <Compile Include="RavenDB-7277.cs" />
+    <Compile Include="RavenDB-6755.cs" />
+    <Compile Include="RavenDB-6754.cs" />
+    <Compile Include="RavenDB-6259_2.cs" />
+    <Compile Include="RavenDB-6312.cs" />
+    <Compile Include="RavenDB-6084.cs" />
+    <Compile Include="RavenDB-6238.cs" />
+    <Compile Include="RavenDB-6259.cs" />
+    <Compile Include="RavenDB-6345.cs" />
+    <Compile Include="RavenDB-6400.cs" />
+    <Compile Include="RavenDB-6626.cs" />
+    <Compile Include="RavenDB_7674.cs" />
+    <Compile Include="RavenDB_5857.cs" />
+    <Compile Include="RavenDB_5669.cs" />
     <Compile Include="NewIndexOptimizationIssue.cs" />
+    <Compile Include="RavenDB-6313.cs" />
+    <Compile Include="RavenDB-5632.cs" />
     <Compile Include="RavenDB-5303.cs" />
     <Compile Include="RavenDB-4393.cs" />
     <Compile Include="RavenDB-4446.cs" />
@@ -155,6 +177,8 @@
     <Compile Include="RavenDB-4904.cs" />
     <Compile Include="RavenDB-5151.cs" />
     <Compile Include="RavenDB-5422.cs" />
+    <Compile Include="RavenDB-5513.cs" />
+    <Compile Include="RavenDB-5525.cs" />
     <Compile Include="RavenDB_4645.cs" />
     <Compile Include="RavenDB_4918.cs" />
     <Compile Include="RavenDb_4706.cs" />
@@ -165,6 +189,7 @@
     <Compile Include="RavenDB-3460.cs" />
     <Compile Include="RavenDB-3736_2.cs" />
     <Compile Include="RavenDB-3973.cs" />
+    <Compile Include="RavenDB-5686.cs" />
     <Compile Include="RavenDB-3979.cs" />
     <Compile Include="RavenDB-3987.cs" />
     <Compile Include="RavenDB_4025.cs" />
@@ -573,9 +598,12 @@
     <Compile Include="RavenDB_554.cs" />
     <Compile Include="RavenDB_556.cs" />
     <Compile Include="RavenDB_4453.cs" />
+    <Compile Include="RavenDB_5617.cs" />
     <Compile Include="RavenDB_576.cs" />
     <Compile Include="RavenDB_578.cs" />
     <Compile Include="RavenDB_579.cs" />
+    <Compile Include="RavenDB_6196\RavenDB_6196.cs" />
+    <Compile Include="RavenDB_6230.cs" />
     <Compile Include="RavenDB_626.cs" />
     <Compile Include="RavenDB_644.cs" />
     <Compile Include="RavenDB_651.cs" />
@@ -595,6 +623,7 @@
     <Compile Include="RavenDB_784.cs" />
     <Compile Include="RavenDB_790.cs" />
     <Compile Include="RavenDB_806.cs" />
+    <Compile Include="RavenDB_8277.cs" />
     <Compile Include="RavenDB_851.cs" />
     <Compile Include="RavenDB_863.cs" />
     <Compile Include="RavenDB_863_2.cs" />
@@ -606,6 +635,7 @@
     <Compile Include="RavenDB_3555.cs" />
     <Compile Include="RavenDB_3994.cs" />
     <Compile Include="RavenDB_4836.cs" />
+    <Compile Include="RavenDB_6065.cs" />
     <Compile Include="RDBQA_1.cs" />
     <Compile Include="RDBQA_11.cs" />
     <Compile Include="RDBQA_13.cs" />
@@ -619,14 +649,17 @@
     <Compile Include="RDoc_56.cs" />
     <Compile Include="RDoc_60.cs" />
     <Compile Include="RDoc_76.cs" />
+    <Compile Include="QueriesStartingWithAtShouldWork.cs" />
     <Compile Include="ReplicationAlerts.cs" />
     <Compile Include="RavenDB_3096.cs" />
     <Compile Include="SlowIndex.cs" />
     <Compile Include="RavenDB_3113.cs" />
     <Compile Include="RavenDB_3106.cs" />
     <Compile Include="RavenDB-3225.cs" />
+    <Compile Include="RavenDB_5514.cs" />
     <Compile Include="ThorMigrationIssues.cs" />
     <Compile Include="WaitForStaleOnAbandonedIndexShouldWork.cs" />
+    <Compile Include="WhatChangedTests.cs" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\Bundles\Raven.Client.Authorization\Raven.Client.Authorization.csproj">
@@ -704,6 +737,7 @@
     </None>
     <None Include="app.config" />
     <None Include="packages.config" />
+    <EmbeddedResource Include="RavenDB_6196\Smuggler.Northwind_4.0.40008.ravendbdump" />
   </ItemGroup>
   <ItemGroup>
     <Service Include="{82A7F48D-3B50-4B1E-B82E-3ADA8210C358}" />

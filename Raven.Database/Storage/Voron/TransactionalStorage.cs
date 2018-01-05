@@ -37,6 +37,7 @@ using Raven.Unix.Native;
 using Raven.Abstractions;
 using Raven.Database.Util;
 using Voron.Impl.Paging;
+using Voron.Impl.Scratch;
 
 namespace Raven.Storage.Voron
 {
@@ -46,8 +47,8 @@ namespace Raven.Storage.Voron
 
         private readonly ConcurrentSet<WeakReference<ITransactionalStorageNotificationHandler>> lowMemoryHandlers = new ConcurrentSet<WeakReference<ITransactionalStorageNotificationHandler>>();
 
-        private readonly Raven.Abstractions.Threading.ThreadLocal<IStorageActionsAccessor> current = new Raven.Abstractions.Threading.ThreadLocal<IStorageActionsAccessor>();
-        private readonly Raven.Abstractions.Threading.ThreadLocal<object> disableBatchNesting = new Raven.Abstractions.Threading.ThreadLocal<object>();
+        private readonly ThreadLocal<IStorageActionsAccessor> current = new ThreadLocal<IStorageActionsAccessor>();
+        private readonly ThreadLocal<object> disableBatchNesting = new ThreadLocal<object>();
 
         private volatile bool disposed;
         private readonly DisposableAction exitLockDisposable;
@@ -102,6 +103,10 @@ namespace Raven.Storage.Voron
                 var exceptionAggregator = new ExceptionAggregator("Could not properly dispose TransactionalStorage");
 
                 exceptionAggregator.Execute(() => current.Dispose());
+                exceptionAggregator.Execute(() => disableBatchNesting.Dispose());
+
+                if (documentCacher != null)
+                    exceptionAggregator.Execute(documentCacher.Dispose);
 
                 if (tableStorage != null)
                     exceptionAggregator.Execute(() => tableStorage.Dispose());
@@ -220,12 +225,6 @@ namespace Raven.Storage.Voron
 
         public Guid Id { get; private set; }
         public IDocumentCacher DocumentCacher { get { return documentCacher; }}
-
-        public IDisposable WriteLock()
-        {
-            Monitor.Enter(this);
-            return exitLockDisposable;
-        }
 
         /// <summary>
         /// Force current operations inside context to be performed directly
@@ -411,7 +410,11 @@ namespace Raven.Storage.Voron
             current.Value.OnStorageCommit += action;
         }
 
-        public void Initialize(IUuidGenerator generator, OrderedPartCollection<AbstractDocumentCodec> documentCodecs, Action<string> putResourceMarker = null)
+        public void Initialize(
+            IUuidGenerator generator, 
+            OrderedPartCollection<AbstractDocumentCodec> documentCodecs, 
+            Action<string> putResourceMarker = null,
+            Action<object,Exception> onError = null)
         {
             if (generator == null) throw new ArgumentNullException("generator");
             if (documentCodecs == null) throw new ArgumentNullException("documentCodecs");
@@ -421,9 +424,14 @@ namespace Raven.Storage.Voron
 
             Log.Info("Starting to initialize Voron storage. Path: " + configuration.DataDirectory);
 
-            StorageEnvironmentOptions options = configuration.RunInMemory ?
+            var options = configuration.RunInMemory ?
                 CreateMemoryStorageOptionsFromConfiguration(configuration) :
                 CreateStorageOptionsFromConfiguration(configuration);
+
+            if (onError != null)
+            {
+                options.OnRecoveryError += (sender, args) => onError(sender,args.Exception);
+            }
 
             options.OnScratchBufferSizeChanged += size =>
             {
@@ -460,6 +468,7 @@ namespace Raven.Storage.Voron
             var options = StorageEnvironmentOptions.CreateMemoryOnly(configuration.Storage.Voron.TempPath);
             options.InitialFileSize = configuration.Storage.Voron.InitialFileSize;
             options.MaxScratchBufferSize = configuration.Storage.Voron.MaxScratchBufferSize * 1024L * 1024L;
+            options.MaxSizePerScratchBufferFile = configuration.Storage.Voron.MaxSizePerScratchBufferFile * 1024L * 1024L;
 
             return options;
         }
@@ -484,6 +493,7 @@ namespace Raven.Storage.Voron
             options.IncrementalBackupEnabled = configuration.Storage.Voron.AllowIncrementalBackups;
             options.InitialFileSize = configuration.Storage.Voron.InitialFileSize;
             options.MaxScratchBufferSize = configuration.Storage.Voron.MaxScratchBufferSize * 1024L * 1024L;
+            options.MaxSizePerScratchBufferFile = configuration.Storage.Voron.MaxSizePerScratchBufferFile * 1024L * 1024L;
 
             return options;
         }
@@ -504,9 +514,9 @@ namespace Raven.Storage.Voron
             });
         }       
 
-        public void Restore(DatabaseRestoreRequest restoreRequest, Action<string> output)
+        public void Restore(DatabaseRestoreRequest restoreRequest, Action<string> output, InMemoryRavenConfiguration globalConfiguration)
         {
-            new RestoreOperation(restoreRequest, configuration, output).Execute();
+            new RestoreOperation(restoreRequest, configuration, globalConfiguration, output).Execute();
         }
 
         public DatabaseSizeInformation GetDatabaseSize()
@@ -533,13 +543,14 @@ namespace Raven.Storage.Voron
         public StorageStats GetStorageStats()
         {
             var stats = tableStorage.Environment.Stats();
-
-            return new StorageStats()
+            return new StorageStats
             {
-                VoronStats = new VoronStorageStats()
+                VoronStats = new VoronStorageStats
                 {
                     FreePagesOverhead = stats.FreePagesOverhead,
                     RootPages = stats.RootPages,
+                    NumberOfAllocatedPages = stats.NumberOfAllocatedPages,
+                    NextPageNumber = stats.NextPageNumber,
                     UnallocatedPagesAtEndOfFile = stats.UnallocatedPagesAtEndOfFile,
                     UsedDataFileSizeInBytes = stats.UsedDataFileSizeInBytes,
                     AllocatedDataFileSizeInBytes = stats.AllocatedDataFileSizeInBytes,
@@ -548,7 +559,8 @@ namespace Raven.Storage.Voron
                     {
                         Id = x.Id,
                         Flags = x.Flags.ToString()
-                    }).ToList()
+                    }).ToList(),
+                    ScratchBufferPoolInfo = Environment.ScratchBufferPool.InfoForDebug(Environment.PossibleOldestReadTransaction)
                 }
             };
         }
@@ -855,9 +867,19 @@ namespace Raven.Storage.Voron
         private IDocumentCacher CreateDocumentCacher(InMemoryRavenConfiguration configuration)
         {
             if (configuration.CacheDocumentsInMemory == false)
-                return new NullDocumentCacher();
+            {
+                documentCacher = new NullDocumentCacher();
+            }
+            else if (configuration.CustomMemoryCacher != null)
+            {
+                documentCacher = configuration.CustomMemoryCacher(configuration);
+            }
+            else
+            {
+                documentCacher = new DocumentCacher(configuration);
+            }
 
-            return new DocumentCacher(configuration);
+            return documentCacher;
         }
     }
 }

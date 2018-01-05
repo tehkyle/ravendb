@@ -19,6 +19,7 @@ namespace Raven.Abstractions.Util
     {
         public static void RunSync(Func<Task> task)
         {
+            var sw = Stopwatch.StartNew();
             var oldContext = SynchronizationContext.Current;
             try
             {
@@ -37,6 +38,7 @@ namespace Raven.Abstractions.Util
                     }
                     finally
                     {
+                        sw.Stop();
                         synch.EndMessageLoop();
                     }
                 }, null);
@@ -45,6 +47,8 @@ namespace Raven.Abstractions.Util
             catch (AggregateException ex)
             {
                 var exception = ex.ExtractSingleInnerException();
+                if (exception is OperationCanceledException)
+                    throw new TimeoutException("Operation timed out after: " + sw.Elapsed, ex);
                 ExceptionDispatchInfo.Capture(exception).Throw();
             }
             finally
@@ -56,7 +60,7 @@ namespace Raven.Abstractions.Util
         public static T RunSync<T>(Func<Task<T>> task)
         {
             var result = default(T);
-            Stopwatch sp = Stopwatch.StartNew();
+            var sw = Stopwatch.StartNew();
             var oldContext = SynchronizationContext.Current;
             try
             {
@@ -76,7 +80,7 @@ namespace Raven.Abstractions.Util
                     }
                     finally
                     {
-                        sp.Stop();
+                        sw.Stop();
                         synch.EndMessageLoop();
                     }
                 }, null);
@@ -86,7 +90,7 @@ namespace Raven.Abstractions.Util
             {
                 var exception = ex.ExtractSingleInnerException();
                 if (exception is OperationCanceledException)
-                    throw new TimeoutException("Operation timed out after: " + sp.Elapsed, ex);
+                    throw new TimeoutException("Operation timed out after: " + sw.Elapsed, ex);
                 ExceptionDispatchInfo.Capture(exception).Throw();
             }
             finally

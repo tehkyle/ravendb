@@ -117,6 +117,9 @@
     </Reference>
   </ItemGroup>
   <ItemGroup>
+    <Compile Include="..\CommonAssemblyInfo.cs">
+      <Link>Properties\CommonAssemblyInfo.cs</Link>
+    </Compile>
     <Compile Include="..\Raven.Tests\Properties\TestAssemblyInfo.cs">
       <Link>Properties\TestAssemblyInfo.cs</Link>
     </Compile>
@@ -141,6 +144,7 @@
     <Compile Include="Bugs\UploadDownload.cs" />
     <Compile Include="Bundles\Versioning\RavenDB_3295.cs" />
     <Compile Include="Bundles\Versioning\RavenDB_3979_files.cs" />
+    <Compile Include="Bundles\Versioning\RavenD_6879.cs" />
     <Compile Include="Bundles\Versioning\VersioningAndSynchronization.cs" />
     <Compile Include="Bundles\Versioning\VersioningTests.cs" />
     <Compile Include="ClientApi\FileQueryTests.cs" />
@@ -180,6 +184,9 @@
     <Compile Include="Issues\RavenDB_4189.cs" />
     <Compile Include="Issues\RavenDB_4690.cs" />
     <Compile Include="Issues\RavenDB_4961.cs" />
+    <Compile Include="Issues\RavenDB_6870.cs" />
+    <Compile Include="Issues\RavenDB_7412.cs" />
+    <Compile Include="Issues\RavenDB_9524.cs" />
     <Compile Include="Issues\RavenDB_FEI_2.cs" />
     <Compile Include="Issues\RavenDB_3648.cs" />
     <Compile Include="Issues\RavenDB_2889.cs" />
@@ -189,6 +196,7 @@
     <Compile Include="Issues\RavenDB_3692.cs" />
     <Compile Include="Issues\RavenDB_3742.cs" />
     <Compile Include="Issues\RavenDB_3919.cs" />
+    <Compile Include="Issues\RavenDB_8926.cs" />
     <Compile Include="Migration\MigrationTests.cs" />
     <Compile Include="Synchronization\FailoverReadFromAllServers.cs" />
     <Compile Include="Synchronization\RavenSynchronizationTestBase.cs" />
@@ -243,7 +251,6 @@
     <Compile Include="Synchronization\IO\RandomCharacterStream.cs" />
     <Compile Include="RemoteFilesHandlerTests.cs" />
     <Compile Include="PagesTests.cs" />
-    <Compile Include="Properties\AssemblyInfo.cs" />
   </ItemGroup>
   <ItemGroup>
     <None Include="app.config" />

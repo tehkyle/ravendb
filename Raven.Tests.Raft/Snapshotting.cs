@@ -34,8 +34,6 @@ namespace Raven.Tests.Raft
                 client.SendClusterConfigurationAsync(new ClusterConfiguration {EnableReplication = false}).Wait(3000);
             }
 
-            WaitForClusterToBecomeNonStale(3);
-
             var leader = servers.FirstOrDefault(server => server.Options.ClusterManager.Value.IsLeader());
             Assert.NotNull(leader);
 
@@ -58,8 +56,8 @@ namespace Raven.Tests.Raft
             {
                 Name = RaftHelper.GetNodeName(newServer.SystemDatabase.TransactionalStorage.Id),
                 Uri = RaftHelper.GetNodeUrl(newServer.SystemDatabase.Configuration.ServerUrl)
-            }).Wait(10000));
-            Assert.True(allNodesFinishedJoining.Wait(10000));
+            }).Wait(20000));
+            Assert.True(allNodesFinishedJoining.Wait(20000));
 
             Assert.True(snapshotInstalledMre.Wait(TimeSpan.FromSeconds(5)));
         }

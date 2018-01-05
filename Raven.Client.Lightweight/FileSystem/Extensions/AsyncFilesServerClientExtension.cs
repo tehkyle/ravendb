@@ -60,9 +60,10 @@ namespace Raven.Client.FileSystem.Extensions
                     request.AddRange(@from.Value);
             }
 
+            HttpResponseMessage response = null;
             try
             {
-                var response = await request.ExecuteRawResponseAsync().ConfigureAwait(false);
+                response = await request.ExecuteRawResponseAsync().ConfigureAwait(false);
                 if (response.StatusCode == HttpStatusCode.NotFound)
                     throw new FileNotFoundException("The file requested does not exists on the file system.", baseUrl + path + filename);
 
@@ -71,10 +72,29 @@ namespace Raven.Client.FileSystem.Extensions
                 if (metadataRef != null)
                     metadataRef.Value = response.HeadersToObject();
 
-                return new DisposableStream(await response.GetResponseStreamWithHttpDecompression().ConfigureAwait(false), request.Dispose);
+                return new DisposableStream(await response.GetResponseStreamWithHttpDecompression().ConfigureAwait(false),() =>
+                {
+                    request.Dispose();
+                    response.Content.Dispose();
+                    response.Dispose();
+                });
             }
             catch (Exception e)
             {
+                try
+                {
+                    request.Dispose();
+
+                    if (response != null)
+                    {
+                        response.Content.Dispose();
+                        response.Dispose();
+                    }
+                }
+                catch (Exception)
+                {
+                }
+
                 throw e.SimplifyException();
             }
         }

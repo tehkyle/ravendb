@@ -35,14 +35,17 @@ namespace Raven.SlowTests.Issues
                             {
                                 Port = 8079,
                                 RunInUnreliableYetFastModeThatIsNotSuitableForProduction = true,
+                                MaxSecondsForTaskToWaitForDatabaseToLoad = 20,
                                 DataDirectory = path,
                                 Settings = { { "Raven/ActiveBundles", "PeriodicBackup" } },
                             };
             config.PostInit();
             ravenDbServer = new RavenDbServer(config)
             {
-                UseEmbeddedHttpServer = true
+                UseEmbeddedHttpServer = true,
             };
+            ravenDbServer.Configuration.MaxSecondsForTaskToWaitForDatabaseToLoad = 30;
+
             ravenDbServer.Initialize();
             documentStore = new DocumentStore
             {

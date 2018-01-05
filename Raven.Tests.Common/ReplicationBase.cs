@@ -89,6 +89,7 @@ namespace Raven.Tests.Common
                 configureStore: configureStore,
                 fiddler: useFiddler,
                 databaseName: databaseName,
+                activeBundles: "Replication",
                 runInMemory: runInMemory);
 
             return documentStore;
@@ -189,7 +190,7 @@ namespace Raven.Tests.Common
             serverConfiguration.RunInMemory = previousServer.SystemDatabase.Configuration.RunInMemory;
             serverConfiguration.Port = previousServer.SystemDatabase.Configuration.Port;
             serverConfiguration.DefaultStorageTypeName = GetDefaultStorageType();
-
+            serverConfiguration.MaxSecondsForTaskToWaitForDatabaseToLoad = 20;
             serverConfiguration.Encryption.UseFips = ConfigurationHelper.UseFipsEncryptionAlgorithms;
 
             ModifyConfiguration(serverConfiguration);
@@ -318,6 +319,20 @@ namespace Raven.Tests.Common
             SetupReplication(source, destinationDocs);
         }
 
+        protected void SetupReplicationWithSkipIndexReplication(IDatabaseCommands source, params DocumentStore[] destinations)
+        {
+            Assert.NotEmpty(destinations);
+
+
+            var destinationDocs = destinations.Select(destination => new RavenJObject
+            {
+                { "Url", destination.Url },
+                { "Database", destination.DefaultDatabase },
+                { "SkipIndexReplication", true }
+            }).ToList();
+
+            SetupReplication(source, destinationDocs);
+        }
 
         protected void SetupReplication(IDatabaseCommands source, params DocumentStore[] destinations)
         {
@@ -325,10 +340,11 @@ namespace Raven.Tests.Common
 
 
             var destinationDocs = destinations.Select(destination => new RavenJObject
-                                                                        {
-                                                                            { "Url", destination.Url },
-                                                                            { "Database", destination.DefaultDatabase }
-                }).ToList();
+                {
+                    {"Url", destination.Url},
+                    {"Database", destination.DefaultDatabase}
+                })
+                .ToList();
 
             SetupReplication(source, destinationDocs);
         }
@@ -337,12 +353,12 @@ namespace Raven.Tests.Common
                                                                         {
             Assert.NotEmpty(destinations);
 
-
             var destinationDocs = destinations.Select(destination => new RavenJObject
                 {
-                                                                            { "Url", destination.Url },
-                                                                            { "Database", destination.DefaultDatabase }
-                }).ToList();
+                    {"Url", destination.Url},
+                    {"Database", destination.DefaultDatabase}
+                })
+                .ToList();
 
             UpdateReplication(source, destinationDocs);
         }
@@ -396,11 +412,11 @@ namespace Raven.Tests.Common
                 new RavenJObject());
         }
 
-        protected TDocument WaitForDocument<TDocument>(IDocumentStore store2, string expectedId) where TDocument : class
+        protected TDocument WaitForDocument<TDocument>(IDocumentStore store2, string expectedId,int timeoutSeconds = 10) where TDocument : class
         {
             TDocument document = null;
 
-            for (int i = 0; i < RetriesCount; i++)
+            for (int i = 0; i < timeoutSeconds * 10; i++)
             {
                 using (var session = store2.OpenSession())
                 {
@@ -418,13 +434,14 @@ namespace Raven.Tests.Common
             {
                 using (var session = store2.OpenSession())
                 {
-                    Thread.Sleep(TimeSpan.FromSeconds(10));
+                    Thread.Sleep(TimeSpan.FromSeconds(timeoutSeconds));
 
                     document = session.Load<TDocument>(expectedId);
                     if (document == null)
                         throw;
 
-                    throw new Exception("WaitForDocument failed, but after waiting 10 seconds more, WaitForDocument succeed. Do we have a race condition here?", ex);
+                    throw new Exception(@"WaitForDocument failed, but after waiting 10 seconds more, 
+                        WaitForDocument succeed. Do we have a race condition here?", ex);
                 }
             }
             return document;

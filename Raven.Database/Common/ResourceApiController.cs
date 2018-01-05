@@ -23,6 +23,7 @@ using Raven.Database.Server;
 using Raven.Database.Server.Controllers;
 using Raven.Database.Server.Security;
 using Raven.Abstractions.Exceptions;
+using Raven.Database.Server.Tenancy;
 
 namespace Raven.Database.Common
 {
@@ -43,7 +44,7 @@ namespace Raven.Database.Common
                 switch (ResourceType)
                 {
                     case ResourceType.Database:
-                        _maxSecondsForTaskToWaitForResourceToLoad = Resource.Configuration.MaxSecondsForTaskToWaitForDatabaseToLoad;
+                        _maxSecondsForTaskToWaitForResourceToLoad = _resourceLandlord.GetSystemConfiguration().MaxSecondsForTaskToWaitForDatabaseToLoad;
                         break;
                     case ResourceType.FileSystem:
                     case ResourceType.TimeSeries:
@@ -319,6 +320,11 @@ namespace Raven.Database.Common
         public override async Task<HttpResponseMessage> ExecuteAsync(HttpControllerContext controllerContext, CancellationToken cancellationToken)
         {
             InnerInitialization(controllerContext);
+
+            HttpResponseMessage msg;
+            if (IsClientV4OrHigher(out msg))
+                return msg;
+
             var authorizer = (MixedModeRequestAuthorizer)controllerContext.Configuration.Properties[typeof(MixedModeRequestAuthorizer)];
             var result = new HttpResponseMessage();
             if (InnerRequest.Method.Method != "OPTIONS")
